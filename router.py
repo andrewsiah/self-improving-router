@@ -14,7 +14,8 @@
   router.py rate --tier T --type Y --base R
       The sampling rate the extension uses for a launch whose base rate is R (1 for unsure: yes, else dual.rate):
       R, or 0.02 once the tier/type cell's last 30 dual runs all held up under the same model list in routing.json,
-      then halved while the last 7 days' eval overhead exceeds 10% of the savings (or savings are 0).
+      then halved while the last 7 days' eval overhead exceeds its share of the savings (or savings are 0): 50% for the
+      first 14 days of calibration, falling in a straight line to 10% at day 30, 10% after.
 
 Config and state live in $SELF_IMPROVING_ROUTER_DIR (default ~/.pi/agent/self-improving-router).
 $SELF_IMPROVING_ROUTER_PI overrides the pi binary.
@@ -30,10 +31,13 @@ PI = os.environ.get("SELF_IMPROVING_ROUTER_PI", "pi")
 TIERS = ("light", "standard", "hard")
 # Evaluate less over time: a cell (tier/type) whose routed pick held up in its last DECAY_PAIRS dual runs samples at
 # FLOOR_RATE; a miss or a changed model list in routing.json puts it back at its base rate. Eval overhead over a
-# trailing BUDGET_DAYS days may not exceed BUDGET_SHARE of the savings routing made; past that every rate halves
-# (at most MAX_HALVINGS times). The audit rate drops to AUDIT_FLOOR once AUDIT_TRUST_PAIRS audits agree at AUDIT_TRUST_AGREE.
+# trailing BUDGET_DAYS days may not exceed a share of the savings routing made; past that every rate halves
+# (at most MAX_HALVINGS times). The share is EARLY_BUDGET_SHARE while the router is still learning (the first EARLY_DAYS days
+# of calibration), falls in a straight line to BUDGET_SHARE at STEADY_DAYS, and stays there; it never goes above 50%, so
+# pairing stays within net savings. The audit rate drops to AUDIT_FLOOR once AUDIT_TRUST_PAIRS audits agree at AUDIT_TRUST_AGREE.
 DECAY_PAIRS, FLOOR_RATE = 30, 0.02
-BUDGET_DAYS, BUDGET_SHARE, MAX_HALVINGS = 7, 0.10, 6
+BUDGET_DAYS, MAX_HALVINGS = 7, 6
+EARLY_BUDGET_SHARE, BUDGET_SHARE, EARLY_DAYS, STEADY_DAYS = 0.50, 0.10, 14, 30
 AUDIT_FLOOR, AUDIT_TRUST_PAIRS, AUDIT_TRUST_AGREE = 0.02, 40, 0.9
 WORKER_NOTE = ("You are working in a git worktree at {cwd}, one of two independent attempts at this task. Work only "
                "inside it, and install dependencies there if the task needs them. Leave your changes uncommitted: no "
@@ -510,23 +514,54 @@ def row_overhead(row):
     return ((row.get("results") or {}).get((row.get("models") or [None, None])[1]) or {}).get("cost", 0) + (row.get("judgeCost") or 0)
 
 
+def utc_epoch(stamp):
+    try: return calendar.timegm(time.strptime(str(stamp)[:19], "%Y-%m-%dT%H:%M:%S"))
+    except ValueError: return None
+
+
+def budget_share(age_days):
+    """The share of 7-day savings that eval overhead may use after `age_days` of calibration: 50% through day 14, a straight
+    line down to 10% at day 30, 10% after."""
+    if age_days <= EARLY_DAYS: return EARLY_BUDGET_SHARE
+    if age_days >= STEADY_DAYS: return BUDGET_SHARE
+    return EARLY_BUDGET_SHARE - (EARLY_BUDGET_SHARE - BUDGET_SHARE) * (age_days - EARLY_DAYS) / (STEADY_DAYS - EARLY_DAYS)
+
+
+def calibration_start(rows):
+    """Epoch seconds when calibration last began: the first dual-run row, or the first row that has a model no earlier row had
+    (the later of those; a `:level` suffix is not a new model). None when no row has a readable time."""
+    first, seen = None, {}
+    for r in rows:
+        t = utc_epoch(r.get("at"))
+        if t is None: continue
+        first = t if first is None else min(first, t)
+        for m in r["models"] if isinstance(r.get("models"), list) else []:
+            if isinstance(m, str): seen[m.partition(":")[0]] = min(t, seen.get(m.partition(":")[0], t))
+    return None if first is None else max([first, *seen.values()])
+
+
 def budget(config):
-    """The trailing-week eval budget: savings, routed launches counted, overhead (dual runs' extra arm, review, judge and
-    audit at list price), dual runs, and how many times every rate halves until overhead is within BUDGET_SHARE of savings
-    (all MAX_HALVINGS when savings are 0 or unknown)."""
-    since = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() - BUDGET_DAYS * 86400))
-    rows = [r for r in read_jsonl(RESULTS) if str(r.get("at", ""))[:19] >= since]
+    """The trailing-week eval budget: savings (an estimate: routed launches' real tokens at the top model's list price, as if
+    every launch would otherwise have gone there), routed launches counted, overhead (dual runs' extra arm, review, judge and
+    audit at list price), dual runs, share (the part of savings overhead may use now, by calibration age: budget_share), and
+    how many times every rate halves until overhead is within share of savings (all MAX_HALVINGS when savings are 0 or unknown)."""
+    now = time.time()
+    since = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now - BUDGET_DAYS * 86400))
+    all_rows = read_jsonl(RESULTS)
+    start = calibration_start(all_rows)
+    share = budget_share(max(0, now - start) / 86400 if start is not None else 0)  # a row stamped in the future is age 0
+    rows = [r for r in all_rows if str(r.get("at", ""))[:19] >= since]
     overhead = sum(row_overhead(r) for r in rows)
     saved, launches = savings(since, config)
     n = 0
-    while n < MAX_HALVINGS and (saved <= 0 or overhead / 2 ** n > BUDGET_SHARE * saved): n += 1
-    return {"savings": saved, "launches": launches, "overhead": overhead, "pairs": len(rows), "halvings": n}
+    while n < MAX_HALVINGS and (saved <= 0 or overhead / 2 ** n > share * saved): n += 1
+    return {"savings": saved, "launches": launches, "overhead": overhead, "pairs": len(rows), "share": share, "halvings": n}
 
 
 def budget_line(b):
     pct = f"{100 * b['overhead'] / b['savings']:.0f}%" if b["savings"] > 0 else "n/a"
-    return (f"eval budget {BUDGET_DAYS} d: savings ${b['savings']:.2f} ({b['launches']} routed launches), overhead ${b['overhead']:.2f} "
-            f"({b['pairs']} dual runs), net ${b['savings'] - b['overhead']:.2f}, overhead {pct} of savings (limit {100 * BUDGET_SHARE:.0f}%)"
+    return (f"eval budget {BUDGET_DAYS} d: est. savings vs all-top-model at list price (upper bound) ${b['savings']:.2f} ({b['launches']} routed launches), overhead ${b['overhead']:.2f} "
+            f"({b['pairs']} dual runs), net ${b['savings'] - b['overhead']:.2f}, overhead {pct} of savings (limit {100 * b['share']:.0f}%)"
             + (f"; every rate halved {b['halvings']}x" if b["halvings"] else "")
             + ("" if b["launches"] else "; insufficient data: needs routing.json prices for the hard route's first model and routed launches with usage"))
 

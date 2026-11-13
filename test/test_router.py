@@ -1,5 +1,5 @@
 """router.py with a fake pi: no model calls. Run: python3 -m unittest discover -s test"""
-import contextlib, importlib, io, json, os, shutil, subprocess, sys, tempfile, time, unittest
+import contextlib, importlib, io, json, os, re, shutil, subprocess, sys, tempfile, time, unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -272,8 +272,20 @@ class AdaptiveTest(Fixture):
                "winner": "p/free" if held else "p/mid", "decidedBy": "cost" if held else "check", "judged": True}
         return dict(row, **k)
 
-    def write(self, rows):
+    def write(self, rows, veteran=True):
+        """veteran: a first row 60 days old with the pair models first, so the router is past its 30 calibration days and the
+        eval budget share is the steady 10% (an empty or fresh log is in its first 14 days, at 50%)."""
+        rows = ([{"at": self.stamp(60), "models": self.MODELS}] if veteran else []) + rows
         (self.tmp / "state/dual-runs.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+
+    @staticmethod
+    def stamp(days_ago=0):
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - days_ago * 86400))
+
+    def limit(self):
+        """The share of savings in force, from the report's budget line."""
+        self.run_cli("report")
+        return re.search(r"\(limit (\d+)%\)", self.stdout.splitlines()[0]).group(1)
 
     def rate(self, base=1.0, tier="standard"):
         self.run_cli("rate", "--tier", tier, "--type", "code", "--base", str(base))
@@ -314,7 +326,44 @@ class AdaptiveTest(Fixture):
         self.run_cli("report")
         line = self.stdout.splitlines()[0]
         self.assertEqual(saved, 20.0)
-        self.assertIn("savings $20.00 (1 routed launches), overhead $5.00 (1 dual runs), net $15.00, overhead 25% of savings (limit 10%); every rate halved 2x", line)
+        self.assertIn("est. savings vs all-top-model at list price (upper bound) $20.00 (1 routed launches), overhead $5.00 (1 dual runs), net $15.00, overhead 25% of savings (limit 10%); every rate halved 2x", line)
+
+    def test_budget_share_is_50_percent_for_14_days_then_falls_straight_to_10_percent_at_day_30(self):
+        for first_row_days_ago, share in ((0, "50"), (14, "50"), (18, "40"), (22, "30"), (26, "20"), (30, "10"), (60, "10")):
+            self.write([{"at": self.stamp(first_row_days_ago), "models": self.MODELS}], veteran=False)
+            self.assertEqual(self.limit(), share, f"{first_row_days_ago} d")
+        self.write([], veteran=False)
+        self.assertEqual(self.limit(), "50")  # no row yet: calibration starts now
+
+    def test_budget_share_between_the_points_and_at_the_exact_boundaries(self):
+        self.assertEqual([round(self.pr.budget_share(d), 6) for d in (-1, 0, 14, 15, 20, 29, 30, 31, 365)],
+                         [0.5, 0.5, 0.5, 0.475, 0.35, 0.125, 0.1, 0.1, 0.1])
+
+    def test_a_new_model_in_the_results_restarts_the_calibration_clock(self):
+        self.write([]); self.assertEqual(self.limit(), "10")
+        self.write([{"at": self.stamp(1), "models": self.MODELS}]); self.assertEqual(self.limit(), "10")  # nothing new
+        self.write([{"at": self.stamp(1), "models": ["p/free:high", "p/mid"]}]); self.assertEqual(self.limit(), "10")  # a level is not a model
+        self.write([{"at": self.stamp(1), "models": ["p/free", "p/new:high"]}]); self.assertEqual(self.limit(), "50")
+        self.write([{"at": self.stamp(22), "models": ["p/free", "p/new:high"]}]); self.assertEqual(self.limit(), "30")
+
+    def test_unusable_rows_and_a_future_row_do_not_break_or_stall_the_clock(self):
+        self.write([{"models": ["x/new"]}, {"at": "garbage", "models": ["x/new", "x/other"]}, {"at": self.stamp(1), "models": "x/new"},
+                    {"at": self.stamp(1), "models": [None, 7]}, {"at": self.stamp(1)}])
+        self.assertEqual(self.limit(), "10")  # no time, no list, or nothing usable in it: nothing new
+        self.write([{"at": self.stamp(-3), "models": ["x/new", "x/other"]}])
+        self.assertEqual(self.limit(), "50")  # stamped in the future: age 0, the cap still holds
+        self.write([{"at": self.stamp(5), "models": ["x/b", "x/c"]}, {"at": self.stamp(40), "models": self.MODELS}, {"at": self.stamp(2), "models": ["x/b", "x/c"]}])
+        self.assertEqual(self.limit(), "50")  # unordered rows: x/b first appeared 5 days ago, not 2 or 40
+
+    def test_early_budget_lets_overhead_reach_half_of_savings_then_halves_as_the_share_falls(self):
+        self.seed_savings(1_000_000)  # $20 of savings
+        fresh = lambda overhead, age=0: self.write([{"at": self.stamp(age), "models": self.MODELS}, self.pair(overhead=overhead)], veteran=False)  # age: days since the first row
+        fresh(10.0); self.assertEqual(self.rate(), 1.0)  # day 0: 50% of $20 is $10
+        fresh(15.0); self.assertEqual(self.rate(), 0.5)  # $15 -> $7.50: halved once
+        fresh(15.0, 22); self.assertEqual(self.rate(), 0.25)  # day 22: 30% is $6; $15 -> $7.50 -> $3.75
+        fresh(15.0, 40); self.assertEqual(self.rate(), 0.125)  # day 40: 10% is $2; $15 -> ... -> $1.875
+        self.seed_savings(0)
+        fresh(0.0); self.assertEqual(self.rate(), 1 / 64)  # no savings still halves every rate at any age
 
     def test_rows_from_before_overhead_was_logged_count_the_partner_and_judge_cost(self):
         self.seed_savings(1_000_000)  # $20
@@ -326,7 +375,7 @@ class AdaptiveTest(Fixture):
         self.routing.pop("prices"); self.configure(); self.seed_savings(10**9)  # savings that cannot be priced count as none
         self.assertEqual(self.rate(), 1 / 64)
         self.run_cli("report")
-        self.assertIn("savings $0.00 (0 routed launches)", self.stdout); self.assertIn("overhead n/a", self.stdout); self.assertIn("insufficient data", self.stdout)
+        self.assertIn("est. savings vs all-top-model at list price (upper bound) $0.00 (0 routed launches)", self.stdout); self.assertIn("overhead n/a", self.stdout); self.assertIn("insufficient data", self.stdout)
 
     def test_audit_rate_drops_to_2_percent_once_40_audits_agree_at_90_percent(self):
         dual = {"auditRate": 0.1}
