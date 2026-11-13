@@ -24,7 +24,7 @@ An orchestrating agent that launches workers also picks their models, and it ten
    - makes two git worktrees from HEAD. Uncommitted changes and untracked files such as `node_modules` are not copied.
    - runs the routed model in one and the tier's partner model in the other,
    - runs the orchestrator's check command in each,
-   - runs each worker's new or changed test files against the other worker's code (cross-tests), then restores the worktree,
+   - runs each worker's new or changed test files against the other worker's code (cross-tests), in a throwaway copy of the worktree so the worktree itself is never touched,
    - optionally has a `review` model list each side's serious issues (P1s) blind,
    - has the `judge` model compare the two diffs blind, twice with the order swapped. If the two answers disagree, that counts as a tie and is logged as `discordant`,
    - at `dual.auditRate` (default 10%), has an `audit` model judge the pair the same way and logs whether it agreed.

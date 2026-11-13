@@ -15,7 +15,7 @@
 Config and state live in $SELF_IMPROVING_ROUTER_DIR (default ~/.pi/agent/self-improving-router).
 $SELF_IMPROVING_ROUTER_PI overrides the pi binary.
 """
-import argparse, calendar, fcntl, hashlib, json, os, random, re, shutil, signal, subprocess, sys, time
+import argparse, calendar, fcntl, hashlib, json, os, random, re, shutil, signal, subprocess, sys, tempfile, time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -204,17 +204,20 @@ def judge(model, arms, prompt, check, base, rundir, name="judge"):
 
 
 def cross_test(arm, rival, check, base, rundir, sub):
-    """Runs the check in arm's worktree with the test files the rival added or changed copied in, then restores the
-    worktree. Returns {"files": n, "ran": bool, "pass": bool or None}. A file that cannot be copied safely (a symlink,
-    a directory, a path leading outside the worktree, a file where a directory is needed) skips the step, recorded as
+    """Runs the check in a throwaway copy of arm's worktree (without .git) with the test files the rival added or
+    changed copied in, so a rival test that deletes or rewrites files cannot damage the worktree that may be returned.
+    Returns {"files": n, "ran": bool, "pass": bool or None}. A file that cannot be copied safely (a symlink, a
+    directory, a path leading outside the copy, a file where a directory is needed) skips the step, recorded as
     "skip", so it cannot decide the pair."""
     names = sh(["git", "-C", rival["worktree"], "diff", "--name-only", "--diff-filter=AM", base, "--", ".", ":(exclude)node_modules"]).stdout
     files = [f for f in names.splitlines() if TEST_PATH.search(f)]
     rec = {"files": len(files), "ran": False, "pass": None}
     if not files: return rec
-    wt, saved, added = Path(arm["worktree"]), {}, []
+    scratch = Path(tempfile.mkdtemp(prefix=f"cross-{arm['label']}-", dir=rundir))
+    wt = scratch / "worktree"
     try:
-        for rel in files:  # check every path before touching any
+        shutil.copytree(arm["worktree"], wt, symlinks=True, ignore=shutil.ignore_patterns(".git"))
+        for rel in files:  # check every path before copying any
             src, dst = Path(rival["worktree"]) / rel, wt / rel
             if src.is_symlink() or dst.is_symlink() or (dst.exists() and not dst.is_file()) or not dst.parent.resolve().is_relative_to(wt.resolve()):
                 raise OSError(f"unsafe path {rel}")
@@ -223,24 +226,16 @@ def cross_test(arm, rival, check, base, rundir, sub):
                 if p.exists() and not p.is_dir(): raise OSError(f"unsafe path {rel}")
                 p = p.parent
         for rel in files:
-            src, dst = Path(rival["worktree"]) / rel, wt / rel
-            if dst.exists(): saved[rel] = (dst.read_bytes(), dst.stat().st_mode)
-            else: added.append(dst)
+            dst = wt / rel
             dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, dst)
+            shutil.copy2(Path(rival["worktree"]) / rel, dst)
         rec["pass"], out = run_check(check, wt / sub)
         rec["ran"] = True
         (rundir / f"{arm['label']}.cross.txt").write_text(out[-20000:])
-    except OSError as e:
+    except OSError as e:  # shutil.Error is an OSError
         rec["skip"] = str(e)[:200]
     finally:
-        for dst in added:  # keep restoring the rest even if one unlink or write fails
-            try: dst.unlink(missing_ok=True)
-            except OSError: pass
-        for rel, (data, mode) in saved.items():
-            try:
-                (wt / rel).write_bytes(data); (wt / rel).chmod(mode)
-            except OSError: pass
+        shutil.rmtree(scratch, ignore_errors=True)
     return rec
 
 

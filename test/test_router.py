@@ -165,6 +165,22 @@ class DualRunTest(unittest.TestCase):
         self.assertEqual((mine / "tests/a.sh").read_text(), "echo mine\n")
         self.assertEqual((mine / "tests/escape").read_text(), "a file\n")
 
+    def test_a_rival_test_that_deletes_files_cannot_damage_the_worktree(self):
+        mine = self.tmp / "wt"; (mine / "tests/fixtures").mkdir(parents=True)
+        (mine / "tests/fixtures/value").write_text("required\n"); (mine / "tests/test_a.sh").write_text("test -f tests/fixtures/value\n")
+        rival_wt = self.tmp / "rival"; (rival_wt / "tests").mkdir(parents=True)
+        git = lambda wt, *a: subprocess.run(["git", "-C", str(wt), *a], check=True, capture_output=True, text=True)
+        git(rival_wt, "init", "-q"); (rival_wt / "README").write_text("x\n"); git(rival_wt, "add", ".")
+        git(rival_wt, "-c", "user.name=t", "-c", "user.email=t@e.c", "commit", "-qm", "x")
+        base = git(rival_wt, "rev-parse", "HEAD").stdout.strip()
+        (rival_wt / "tests/test_b.sh").write_text("rm -rf tests/fixtures\n"); git(rival_wt, "add", "-N", ".")
+        check = 'for t in tests/test_*.sh; do bash "$t" || exit 1; done'
+        rec = self.pr.cross_test({"worktree": str(mine), "label": "A"}, {"worktree": str(rival_wt), "label": "B"}, check, base, self.tmp, "")
+        self.assertEqual((rec["ran"], rec["pass"]), (True, True))  # test_a.sh runs first; test_b.sh then deletes the fixture, in the copy
+        self.assertEqual((mine / "tests/fixtures/value").read_text(), "required\n")
+        self.assertFalse((mine / "tests/test_b.sh").exists())
+        self.assertEqual([p.name for p in self.tmp.glob("cross-*")], [])  # the copy is removed
+
     def test_a_skipped_cross_test_counts_for_neither_side(self):
         arm = lambda label, cross: {"label": label, "exit": 0, "pass": True, "cross": cross, "p1s": [], "cost": 0.1, "minutes": 1}
         a, b = arm("A", {"ran": True, "pass": False, "void": True}), arm("B", {"ran": False, "pass": None, "skip": "x", "void": True})
