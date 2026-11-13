@@ -20,15 +20,15 @@ An orchestrating agent that launches workers also picks their models, and it ten
 
 2. **Decision and outcome logs.** Each launch writes one row to `decisions.jsonl`: the answers, the model, and a hash of the task, never its text. Once the launch returns, a row in `runs.jsonl` links it to its run id. `router.py outcomes` joins these rows with the run results to show the share of launches on top models, success by tier, retries and escalations, and how far the estimates were off.
 
-3. **Dual runs.** Code launches marked `unsure: yes` always run on two models. Other code launches run on two models at a small rate (`dual.rate`). For a dual run, the launch is stopped and the orchestrator gets one command to run instead. That command:
-   - makes two git worktrees from HEAD,
+3. **Dual runs.** A single code launch marked `unsure: yes` always runs on two models. Other single code launches run on two models at a small rate (`dual.rate`). For a dual run, the launch is stopped and the orchestrator gets one command to run instead. That command:
+   - makes two git worktrees from HEAD. Uncommitted changes and untracked files such as `node_modules` are not copied.
    - runs the routed model in one and the tier's partner model in the other,
    - runs the orchestrator's check command in each,
    - has a judge model compare the two diffs blind (labels A and B are assigned at random).
 
    The winner is the worker that finished and passed its check, with fewer serious issues. If those tie, the judge's preference decides, and then the lower cost. Each run adds a row to `dual-runs.jsonl`. `router.py report` shows win rate, pass rate and cost per model, and that tells you where a cheaper model is enough and how to change the routing table.
 
-   A launch is never run twice when its task mentions outside side effects (deploy, publish, push, migrations, sending messages) or secrets and money. At most `dual.maxPairs` dual runs are in flight at once.
+   A keyword filter skips tasks that mention outside side effects (deploy, publish, push, migrations, sending messages) or secrets, tokens and money. It catches plain wording, not everything, so keep such work out of tasks you want paired. At most `dual.maxPairs` dual runs run at once; past that, the command says to run a single worker.
 
 ## Install
 
@@ -84,12 +84,14 @@ python3 $R dual-run --repo DIR --task FILE --check 'npm test'   # what a blocked
 
 ## Status
 
-The route gate, the logs, `outcomes`, and dual runs with a judge and `report` all work and have tests (`npm test`).
+Done, with tests (`npm test`):
+- the route gate,
+- the decision and outcome logs, and `outcomes`,
+- dual runs with a blind judge, and `report`.
 
 In progress:
 - Saving each finished task so it can be replayed later as an offline eval. When a new model comes out, you can test it on your own past work.
 - Picking the ~100 most informative tasks for that eval: the tasks that best separate models, weighted toward the ones where routing went wrong.
-- A stronger judge for dual runs.
 
 A blog post with results is coming.
 

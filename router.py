@@ -13,7 +13,7 @@
 Config and state live in $SELF_IMPROVING_ROUTER_DIR (default ~/.pi/agent/self-improving-router).
 $SELF_IMPROVING_ROUTER_PI overrides the pi binary.
 """
-import argparse, calendar, json, os, random, re, signal, subprocess, sys, time
+import argparse, calendar, fcntl, json, os, random, re, signal, subprocess, sys, time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -23,8 +23,9 @@ RESULTS = STATE / "dual-runs.jsonl"
 PI = os.environ.get("SELF_IMPROVING_ROUTER_PI", "pi")
 TIERS = ("light", "standard", "hard")
 WORKER_NOTE = ("You are working in a git worktree at {cwd}, one of two independent attempts at this task. Work only "
-               "inside it. Leave your changes uncommitted: no commits, pushes or branch changes, and nothing outside "
-               "this directory. Finish the task, run the relevant tests, then reply with a short summary.")
+               "inside it, and install dependencies there if the task needs them. Leave your changes uncommitted: no "
+               "commits, pushes or branch changes, and nothing outside this directory. Finish the task, run the "
+               "relevant tests, then reply with a short summary.")
 JUDGE_PROMPT = """Blind review. Two independent attempts at the same coding task, labelled A and B, both started from \
 commit {base}. Judge only the work; do not try to work out who or what wrote each one.
 
@@ -143,6 +144,24 @@ def pick_winner(arms):
     return min(arms, key=lambda a: (a["exit"] != 0, not a["pass"], len(a["p1s"]), not a.get("preferred"), a["cost"]))
 
 
+def max_pairs():
+    return int(((read_json(STATE / "routing.json") or {}).get("dual") or {}).get("maxPairs") or 3)
+
+
+def claim_slot(rundir):
+    """Creates runs/<id> as this run's in-flight marker, unless dual.maxPairs runs are already in flight (a runs dir
+    touched in the last 3 hours with no dual-runs.jsonl row). Counted and created under one lock."""
+    STATE.mkdir(parents=True, exist_ok=True)
+    with open(STATE / "runs.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        done = {r.get("id") for r in read_jsonl(RESULTS)}
+        runs = STATE / "runs"
+        busy = [d for d in runs.iterdir() if d.is_dir() and d.name not in done and time.time() - d.stat().st_mtime < 3 * 3600] if runs.is_dir() else []
+        if len(busy) >= max_pairs(): return False
+        rundir.mkdir(parents=True)
+        return True
+
+
 def dual_run(args):
     task = read_json(args.task) or {}
     prompt, models = task.get("prompt"), task.get("models") or []
@@ -156,16 +175,17 @@ def dual_run(args):
     if sh(["git", "-C", str(repo), "status", "--porcelain"]).stdout.strip():
         print(f"self-improving-router: note: uncommitted changes in {repo} are not in the worktrees (they start from {base[:12]})", file=sys.stderr)
     rid = Path(args.task).stem if re.fullmatch(r"[\w-]+", Path(args.task).stem) else time.strftime("%Y%m%d%H%M%S")
+    if (STATE / "runs" / rid).exists(): rid += "-" + os.urandom(2).hex()  # the same task file run again
     rundir = STATE / "runs" / rid
-    rundir.mkdir(parents=True, exist_ok=True)  # also marks the run as in flight for the extension
+    if not claim_slot(rundir):
+        print(f"self-improving-router: {max_pairs()} dual runs already in flight; run a single worker instead", file=sys.stderr)
+        return 3
     labels = ["A", "B"]; random.shuffle(labels)  # blind: which model is A is random per run
     arms = []
     for model, label in zip(models, labels):
         wt = STATE / "worktrees" / f"{repo.name}-{rid}-{label}"
         r = sh(["git", "-C", str(repo), "worktree", "add", "--detach", str(wt), base])
         if r.returncode: raise SystemExit(f"self-improving-router: git worktree add failed: {r.stderr[-300:]}")
-        if (repo / "node_modules").exists() and not (wt / "node_modules").exists():
-            (wt / "node_modules").symlink_to(repo / "node_modules")
         arms.append({"model": model, "label": label, "worktree": str(wt), "p1s": []})
     print(f"self-improving-router {rid}: {models[0]} vs {models[1]}", file=sys.stderr, flush=True)
     t0 = time.time()

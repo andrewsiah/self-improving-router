@@ -66,12 +66,14 @@ test("isAvailable needs a known model with credentials", () => {
 
 test("pairPlan: unsure always pairs, others at the rate, never non-code or side effects", () => {
   const route = (s: string) => parseRoute(s)!;
-  assert.deepEqual(pairPlan(CONFIG, route("tier: standard | type: code | unsure: yes"), "p/mid", "x"), { arm: "unsure", models: ["p/mid", "p/big:high"] });
+  const unsure = "route: tier: standard - x | type: code | minutes: 20 | tokens: 15k | unsure: yes";
+  assert.deepEqual(pairPlan(CONFIG, route(unsure), "p/mid", unsure), { arm: "unsure", models: ["p/mid", "p/big:high"] });
   assert.equal(pairPlan(CONFIG, route("tier: standard | type: code | unsure: no"), "p/mid", "x", () => 0), null); // rate 0
   assert.deepEqual(pairPlan({ ...CONFIG, dual: { ...CONFIG.dual, rate: 0.5 } }, route("tier: standard | type: code"), "p/mid", "x", () => 0.1)?.arm, "sample");
   assert.equal(pairPlan(CONFIG, route("tier: standard | type: research | unsure: yes"), "p/mid", "x"), null);
   assert.equal(pairPlan(CONFIG, route("tier: light | type: code | unsure: yes"), "p/small", "x"), null); // no partner
-  assert.equal(pairPlan(CONFIG, route("tier: standard | type: code | unsure: yes"), "p/mid", "then deploy it"), null);
+  for (const words of ["then deploy it", "git -C . push origin HEAD", "send a chat message to the team", "rotate the access token", "revoke old API tokens"])
+    assert.equal(pairPlan(CONFIG, route("tier: standard | type: code | unsure: yes"), "p/mid", words), null, words);
   assert.equal(pairPlan(CONFIG, route("tier: hard | type: code | unsure: yes"), "p/mid", "x"), null); // partner is the same model
 });
 
@@ -130,9 +132,12 @@ test("an unsure code launch in a git repo becomes a dual run; the re-issued call
   assert.equal(again.model, "p/mid");
 });
 
-test("no dual run outside a git repo or past maxPairs", async () => {
+test("no dual run outside a git repo, past maxPairs, or for tasks, chain and workflow children", async () => {
   const { dir, call } = setup();
   const task = "tier: standard | type: code | unsure: yes";
+  assert.equal(await call({ tasks: [{ agent: "worker", task }] }, "c3"), undefined);
+  assert.equal(await call({ chain: [{ agent: "worker", task }, { agent: "reviewer", task: "review {previous}" }] }, "c4"), undefined);
+  assert.equal(await call({ workflow: "parallel", args: { tasks: [{ agent: "worker", task }] } }, "c5"), undefined);
   assert.equal(await call({ agent: "worker", task, cwd: tmpdir() }), undefined);
   mkdirSync(path.join(dir, "runs", "busy"), { recursive: true });
   assert.equal(await call({ agent: "worker", task }, "c2"), undefined);

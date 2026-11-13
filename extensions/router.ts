@@ -22,8 +22,9 @@ const EXAMPLE = "route: tier: standard - <why> | type: code | minutes: 20 | toke
 const CLI = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../router.py");
 const REISSUE_MS = 10 * 60 * 1000;
 const RUN_TTL_MS = 3 * 3600 * 1000; // a dual run dir older than this with no result counts as crashed
-// Work that should never run twice (outside side effects) or stays on one careful run (secrets, money).
-const NO_PAIR = /secret|credential|api.?key|passw|oauth|permission|payment|billing|invoice|refund|\bdeploy|\bpublish|git push|force.push|migrat(e|ion)|\bproduction\b|\bprod\b|send (an? )?(e-?mail|message)/i;
+// Keyword check for work that should not run twice (outside side effects) or stays on one careful run (secrets,
+// money). It is a word filter, not a guarantee.
+const NO_PAIR = /secret|credential|\btoken\b|\b(access|auth|api|bearer|refresh)[ _-]?tokens\b|api.?key|passw|oauth|permission|payment|billing|invoice|refund|\bdeploy|\bpublish|\bpush\b|\bmigrat(e|ion)|\bprod(uction)?\b|\b(send|post)\b.{0,30}\b(e-?mail|message|dm|notification|comment)/i;
 
 export const stateDir = (env: Record<string, string | undefined>) =>
   env.SELF_IMPROVING_ROUTER_DIR || path.join(env.PI_CODING_AGENT_DIR || path.join(homedir(), ".pi/agent"), "self-improving-router");
@@ -213,8 +214,8 @@ export function registerRouter(pi: any, env: Record<string, string | undefined>,
       const hard = rows.filter(r => r.outcome === "blocked-hard");
       let block: string | null = missing.length ? missingText([...new Set(missing.map(r => r.agent as string))])
         : hard.length ? hardText([...new Set(hard.map(r => r.requested as string))]) : null;
-      // A single routed launch inside a git repo may become a dual run instead.
-      const only = plans.length === 1 && plans[0].row.outcome === "routed" && plans[0].row.model ? plans[0] : null;
+      // A plain single-agent launch (no tasks, chain or workflow) inside a git repo may become a dual run instead.
+      const only = plans.length === 1 && plans[0].entry === event.input && plans[0].row.outcome === "routed" && plans[0].row.model ? plans[0] : null;
       if (!block && only) {
         const cwd = path.resolve(ctx?.cwd || process.cwd(), typeof event.input.cwd === "string" ? event.input.cwd.replace(/^~(?=\/|$)/, homedir()) : "");
         const key = taskHash(`${cwd}\0${only.task}`);

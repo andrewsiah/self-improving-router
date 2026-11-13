@@ -73,6 +73,14 @@ class DualRunTest(unittest.TestCase):
         row = json.loads((self.tmp / "state/dual-runs.jsonl").read_text())
         self.assertFalse(row["judged"]); self.assertEqual(row["winner"], "p/bad")  # both pass, bad is cheaper
 
+    def test_max_pairs_refuses_past_the_cap(self):
+        state = self.tmp / "state"; (state / "runs/busy").mkdir(parents=True)
+        (state / "routing.json").write_text(json.dumps({"dual": {"maxPairs": 1}}))
+        self.assertEqual(self.run_cli("dual-run", "--repo", str(self.repo), "--task", self.task(["p/good", "p/bad"]), "--check", "true"), 3)
+        self.assertFalse((state / "dual-runs.jsonl").exists())
+        (state / "dual-runs.jsonl").write_text(json.dumps({"id": "busy"}) + "\n")  # busy finished: the slot is free again
+        self.assertEqual(self.run_cli("dual-run", "--repo", str(self.repo), "--task", self.task(["p/good", "p/bad"]), "--check", "true"), 0)
+
     def test_bad_task_file(self):
         with self.assertRaises(SystemExit):
             self.run_cli("dual-run", "--repo", str(self.repo), "--task", self.task(["p/a", "p/a"]), "--check", "true")
