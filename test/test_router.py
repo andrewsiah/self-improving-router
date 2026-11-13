@@ -125,6 +125,39 @@ class DualRunTest(unittest.TestCase):
         self.run_cli("report")
         self.assertIn("audit agreed 1/1", self.stdout)
 
+    def test_cross_tests_keep_modes_and_never_follow_symlinks(self):
+        mine = self.tmp / "wt"; (mine / "tests").mkdir(parents=True)
+        outside = self.tmp / "outside.sh"
+        rival_wt = self.tmp / "rival"; (rival_wt / "tests").mkdir(parents=True)
+        for name in ("run.sh", "link.sh"): (rival_wt / "tests" / name).write_text("echo rival\n")
+        git = lambda wt, *a: subprocess.run(["git", "-C", str(wt), *a], check=True, capture_output=True, text=True)
+        for wt in (mine, rival_wt):
+            git(wt, "init", "-q")
+        (mine / "tests/run.sh").write_text("echo mine\n"); (mine / "tests/run.sh").chmod(0o755)
+        (mine / "tests/link.sh").symlink_to(outside)  # dangling
+        for wt in (mine, rival_wt): git(wt, "add", "-A"); git(wt, "-c", "user.name=t", "-c", "user.email=t@e.c", "commit", "-qm", "x")
+        base = git(rival_wt, "rev-parse", "HEAD").stdout.strip()
+        (rival_wt / "tests/run.sh").write_text("echo rival changed\n")
+        (rival_wt / "tests/link.sh").write_text("echo rival changed\n")
+        arm, rival = {"worktree": str(mine), "label": "A"}, {"worktree": str(rival_wt), "label": "B"}
+        rec = self.pr.cross_test(arm, rival, "true", base, self.tmp, "")
+        self.assertIn("skip", rec); self.assertFalse(outside.exists()); self.assertTrue((mine / "tests/link.sh").is_symlink())
+        (mine / "tests/link.sh").unlink(); (mine / "tests/link.sh").write_text("echo mine\n")
+        rec = self.pr.cross_test(arm, rival, "true", base, self.tmp, "")
+        self.assertEqual((rec["ran"], rec["pass"]), (True, True))
+        self.assertEqual(((mine / "tests/run.sh").read_text(), (mine / "tests/run.sh").stat().st_mode & 0o777), ("echo mine\n", 0o755))
+
+    def test_a_skipped_cross_test_counts_for_neither_side(self):
+        arm = lambda label, cross: {"label": label, "exit": 0, "pass": True, "cross": cross, "p1s": [], "cost": 0.1, "minutes": 1}
+        a, b = arm("A", {"ran": True, "pass": False, "void": True}), arm("B", {"ran": False, "pass": None, "skip": "x", "void": True})
+        self.assertIs(self.pr.pick_winner([b, a], "A"), a); self.assertEqual(self.pr.decided_by(a, b, "A"), "judge")
+
+    def test_report_reads_rows_from_before_the_judge_upgrade(self):
+        state = self.tmp / "state"; state.mkdir()
+        (state / "dual-runs.jsonl").write_text(json.dumps({"id": "old", "judge": "p/judge", "judged": True, "winner": "p/a", "results": {
+            "p/a": {"pass": True, "p1s": [], "cost": 0.1, "minutes": 1.0}, "p/b": {"pass": True, "p1s": [], "cost": 0.2, "minutes": 1.0}}}) + "\n")
+        self.assertEqual(self.run_cli("report"), 0); self.assertIn("0 discordant, 0/1", self.stdout)
+
     def test_ties_go_to_the_cheaper_then_the_faster_arm(self):
         arm = lambda label, cost, minutes: {"label": label, "exit": 0, "pass": True, "cross": {"pass": None}, "p1s": [], "cost": cost, "minutes": minutes}
         a, b = arm("A", 0.2, 5), arm("B", 0.2, 3)

@@ -63,7 +63,7 @@ TEST_PATH = re.compile(r"(^|/)(tests?|__tests__|specs?|e2e|fixtures?)/|(^|/)conf
                        r"(^|/)(test_[^/]*|[^/]*(_test|\.test|\.spec|_spec))\.(py|[cm]?[jt]sx?|go|rs|rb|sh)$", re.I)
 # Winner rule: the first step where the arms differ decides (lower is better); a tie there goes to the next step.
 STEPS = (("finished", lambda a, verdict: a["exit"] != 0), ("check", lambda a, verdict: not a["pass"]),
-         ("cross", lambda a, verdict: a["cross"]["pass"] is False), ("p1s", lambda a, verdict: len(a["p1s"])),
+         ("cross", lambda a, verdict: a["cross"]["pass"] is False and not a["cross"].get("void")), ("p1s", lambda a, verdict: len(a["p1s"])),
          ("judge", lambda a, verdict: a["label"] != verdict), ("cost", lambda a, verdict: a["cost"]),
          ("minutes", lambda a, verdict: a["minutes"]))
 
@@ -173,7 +173,8 @@ def read_only_pi(model, text, rundir, name):
 
 def arm_lines(arms, rundir, numbered):
     """One line per arm for a judge prompt: check results and the paths of its output and diff."""
-    cross = lambda a: "FAILED" if a["cross"]["pass"] is False else "PASSED" if a["cross"]["ran"] else "none added"
+    cross = lambda a: ("not run" if a["cross"].get("void") else "FAILED" if a["cross"]["pass"] is False
+                       else "PASSED" if a["cross"]["ran"] else "none added")
     return "\n".join(f"{f'Candidate {n}' if numbered else a['label']}: check {'PASSED' if a['pass'] else 'FAILED'} "
                       f"(output: {rundir / (a['label'] + '.check.txt')}); check with the other side's new tests added: {cross(a)}; "
                       f"diff {rundir / (a['label'] + '.diff')} ({a['diffLines']} lines); worktree {a['worktree']}"
@@ -204,19 +205,24 @@ def judge(model, arms, prompt, check, base, rundir, name="judge"):
 
 def cross_test(arm, rival, check, base, rundir, sub):
     """Runs the check in arm's worktree with the test files the rival added or changed copied in, then restores the
-    worktree. Returns {"files": n, "ran": bool, "pass": bool or None}. A copy error skips the step so it cannot decide the pair."""
+    worktree. Returns {"files": n, "ran": bool, "pass": bool or None}. A file that cannot be copied safely (a symlink,
+    a directory, a path leading outside the worktree) skips the step, recorded as "skip", so it cannot decide the pair."""
     names = sh(["git", "-C", rival["worktree"], "diff", "--name-only", "--diff-filter=AM", base, "--", ".", ":(exclude)node_modules"]).stdout
     files = [f for f in names.splitlines() if TEST_PATH.search(f)]
     rec = {"files": len(files), "ran": False, "pass": None}
     if not files: return rec
     wt, saved, added = Path(arm["worktree"]), {}, []
     try:
+        for rel in files:  # check every path before touching any
+            src, dst = Path(rival["worktree"]) / rel, wt / rel
+            if src.is_symlink() or dst.is_symlink() or (dst.exists() and not dst.is_file()) or not dst.parent.resolve().is_relative_to(wt.resolve()):
+                raise OSError(f"unsafe path {rel}")
         for rel in files:
-            dst = wt / rel
-            if dst.exists(): saved[rel] = dst.read_bytes()
+            src, dst = Path(rival["worktree"]) / rel, wt / rel
+            if dst.exists(): saved[rel] = (dst.read_bytes(), dst.stat().st_mode)
             else: added.append(dst)
             dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(Path(rival["worktree"]) / rel, dst)
+            shutil.copy2(src, dst)
         rec["pass"], out = run_check(check, wt / sub)
         rec["ran"] = True
         (rundir / f"{arm['label']}.cross.txt").write_text(out[-20000:])
@@ -224,7 +230,8 @@ def cross_test(arm, rival, check, base, rundir, sub):
         rec["skip"] = str(e)[:200]
     finally:
         for dst in added: dst.unlink(missing_ok=True)
-        for rel, data in saved.items(): (wt / rel).write_bytes(data)
+        for rel, (data, mode) in saved.items():
+            (wt / rel).write_bytes(data); (wt / rel).chmod(mode)
     return rec
 
 
@@ -290,6 +297,8 @@ def dual_run(args):
     cost, review_v, jury, audit = 0.0, None, None, None
     if len(ran) == 2:  # a worker that did not finish loses at once; no judging
         for a in arms: a["cross"] = cross_test(a, next(b for b in arms if b is not a), args.check, base, rundir, sub)
+        if any("skip" in a["cross"] for a in arms):  # one side could not be cross-tested, so neither side's result counts
+            for a in arms: a["cross"]["void"] = True
         if dual.get("review"):
             review_v, c = review(dual["review"], arms, prompt, args.check, base, rundir); cost += c
         jury, c = judge(dual.get("judge") or models[0], arms, prompt, args.check, base, rundir); cost += c
@@ -322,7 +331,7 @@ def dual_run(args):
     for a in arms:
         x = a["cross"]
         print(f"  {a['label']} {a['model']}: exit={a['exit']} check={'pass' if a['pass'] else 'FAIL'} "
-              f"cross={'-' if not x['ran'] else 'pass' if x['pass'] else 'FAIL'} P1s={len(a['p1s'])} ${a['cost']:.3f} {a['minutes']} min", file=sys.stderr)
+              f"cross={'-' if not x['ran'] or x.get('void') else 'pass' if x['pass'] else 'FAIL'} P1s={len(a['p1s'])} ${a['cost']:.3f} {a['minutes']} min", file=sys.stderr)
     audit_note = f"audit {'agreed' if audit['agree'] else 'unknown' if audit['agree'] is None else 'DISAGREED'}" if audit else "no audit"
     print(f"self-improving-router: judge {verdict} ({audit_note}), decided by {row['decidedBy']}; winner {win['model']}. Its diff is uncommitted in the worktree below; the other diff is saved at "
           f"{rundir / (lose['label'] + '.diff')}. Remove the other worktree: {remove(repo, lose['worktree'])}", file=sys.stderr)
@@ -346,9 +355,10 @@ def report(_args):
         win = f"{100 * s['wins'] / j:5.0f}" if j else f"{'-':>5}"
         print(f"{model:44} {n:4d} {j:6d} {win} {100 * s['pass'] / n:6.0f} {s['p1s'] / n:6.2f} {s['cost'] / n:7.3f} {s['minutes'] / n:7.1f}")
     judged = [r for r in rows if r.get("judged")]
-    audits = [r["audit"]["agree"] for r in rows if r.get("audit") and r["audit"]["agree"] is not None]
-    print(f"judge: {sum((r['judge'] or {}).get('verdict') == 'discordant' for r in rows)} discordant, "
-          f"{sum(r['decidedBy'] in ('cost', 'minutes') for r in judged)}/{len(judged)} judged runs decided by cost or time; "
+    audits = [r["audit"]["agree"] for r in rows if isinstance(r.get("audit"), dict) and r["audit"].get("agree") is not None]
+    discordant = sum(isinstance(r.get("judge"), dict) and r["judge"].get("verdict") == "discordant" for r in rows)  # older rows: judge is a model name
+    print(f"judge: {discordant} discordant, "
+          f"{sum(r.get('decidedBy') in ('cost', 'minutes') for r in judged)}/{len(judged)} judged runs decided by cost or time; "
           f"audit agreed {sum(audits)}/{len(audits)}")
     return 0
 
