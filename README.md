@@ -24,9 +24,12 @@ An orchestrating agent that launches workers also picks their models, and it ten
    - makes two git worktrees from HEAD. Uncommitted changes and untracked files such as `node_modules` are not copied.
    - runs the routed model in one and the tier's partner model in the other,
    - runs the orchestrator's check command in each,
-   - has a judge model compare the two diffs blind (labels A and B are assigned at random).
+   - runs each worker's new or changed test files against the other worker's code (cross-tests), then restores the worktree,
+   - optionally has a `review` model list each side's serious issues (P1s) blind,
+   - has the `judge` model compare the two diffs blind, twice with the order swapped. If the two answers disagree, that counts as a tie and is logged as `discordant`,
+   - at `dual.auditRate` (default 10%), has an `audit` model judge the pair the same way and logs whether it agreed.
 
-   The winner is the worker that finished and passed its check, with fewer serious issues. If those tie, the judge's preference decides, and then the lower cost. Each run adds a row to `dual-runs.jsonl`. `router.py report` shows win rate, pass rate and cost per model, and that tells you where a cheaper model is enough and how to change the routing table.
+   A worker that didn't finish loses at once and nothing is judged. Otherwise the first step where the two differ decides: finished, own check, cross-tests, fewer P1s, the judge's agreed preference, lower cost, shorter wall time. Ties go to the cheaper worker, then the faster one. Each run adds a row to `dual-runs.jsonl`, including which step decided it. `router.py report` shows win rate, pass rate and cost per model, how often the judge was discordant or the pair was decided on cost, and how often the audit agreed. That tells you where a cheaper model is enough and how to change the routing table.
 
    A keyword filter skips tasks that mention outside side effects (deploy, publish, push, migrations, sending messages) or secrets, tokens and money. It catches plain wording, not everything, so keep such work out of tasks you want paired. At most `dual.maxPairs` dual runs run at once; past that, the command says to run a single worker.
 
@@ -41,7 +44,7 @@ mkdir -p ~/.pi/agent/self-improving-router
 cp ~/.pi/agent/git/github.com/andrewsiah/self-improving-router/routing.example.json ~/.pi/agent/self-improving-router/routing.json
 ```
 
-Then edit `routing.json`. The router does nothing until that file exists. Set `SELF_IMPROVING_ROUTER_DIR` to keep the config and logs somewhere else.
+Then edit `routing.json`. The router does nothing until that file exists. Set `SELF_IMPROVING_ROUTER_DIR` to keep the config and logs somewhere else. If you set `PI_CODING_AGENT_DIR`, pi and the router use that directory instead of `~/.pi/agent`, so change the paths above to match.
 
 ## Config
 
@@ -51,7 +54,7 @@ Then edit `routing.json`. The router does nothing until that file exists. Set `S
   "routes": {
     "light": ["anthropic/claude-haiku-5-5", "anthropic/claude-sonnet-5-5"],
     "standard": ["anthropic/claude-sonnet-5-5", "anthropic/claude-haiku-5-5"],
-    "hard": ["anthropic/claude-opus-5-5:high", "anthropic/claude-sonnet-5-5:high"],
+    "hard": ["anthropic/claude-opus-5-5:high"],
     "*/research": ["anthropic/claude-sonnet-5-5"]
   },
   "dual": {
@@ -62,7 +65,10 @@ Then edit `routing.json`. The router does nothing until that file exists. Set `S
       "standard": "anthropic/claude-opus-5-5:high",
       "hard": "anthropic/claude-sonnet-5-5:high"
     },
-    "judge": "anthropic/claude-opus-5-5:high"
+    "judge": "anthropic/claude-opus-5-5:high",
+    "review": "anthropic/claude-sonnet-5-5",
+    "audit": "anthropic/claude-sonnet-5-5:high",
+    "auditRate": 0.1
   }
 }
 ```
@@ -72,6 +78,8 @@ These model ids are examples. Replace them with models your pi setup can run (`p
 - `agents`: the subagent names the router handles. List any aliases too.
 - `routes`: keys are `<tier>/<type>`, `*/<type>` or `<tier>`, and the first key that matches wins. Each value is a list of models in order of preference, written `provider/id`, with an optional `:thinking` level. The file is re-read on every launch.
 - `dual.partner`: the model each tier is tested against. For light and standard, pick a stronger model to find out whether the cheap one is enough. For hard, pick a cheaper model to find out whether the top one was needed.
+- `dual.judge`: the model that compares the two diffs (default: the first model of the pair). Prefer a model that is neither of the pair. `dual.review` and `dual.audit` are optional and off unless set; `dual.auditRate` is the share of pairs the audit model also judges.
+- `outcomes` counts every launch on a model from the `hard` list as a top-model launch, so keep cheaper fallback models out of that list.
 
 ## Commands
 
@@ -87,7 +95,9 @@ python3 $R dual-run --repo DIR --task FILE --check 'npm test'   # what a blocked
 Done, with tests (`npm test`):
 - the route gate,
 - the decision and outcome logs, and `outcomes`,
-- dual runs with a blind judge, and `report`.
+- dual runs with cross-tests, an optional review, a pairwise judge asked in both orders, a sampled audit judge, and `report`.
+
+Tested end to end in a fresh pi (installed from this README, real model calls): the gate blocks a launch without `route:`, a light launch runs on the light model, the logs and `outcomes` fill in, and a dual run on a throwaway repo ends with a judge verdict and shows up in `report`.
 
 In progress:
 - Saving each finished task so it can be replayed later as an offline eval. When a new model comes out, you can test it on your own past work.

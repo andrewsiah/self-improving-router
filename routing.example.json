@@ -4,7 +4,7 @@
   "routes": {
     "light": ["anthropic/claude-haiku-5-5", "anthropic/claude-sonnet-5-5"],
     "standard": ["anthropic/claude-sonnet-5-5", "anthropic/claude-haiku-5-5"],
-    "hard": ["anthropic/claude-opus-5-5:high", "anthropic/claude-sonnet-5-5:high"],
+    "hard": ["anthropic/claude-opus-5-5:high"],
     "*/research": ["anthropic/claude-sonnet-5-5"]
   },
   "dual": {
@@ -15,6 +15,9 @@
       "standard": "anthropic/claude-opus-5-5:high",
       "hard": "anthropic/claude-sonnet-5-5:high"
     },
-    "judge": "anthropic/claude-opus-5-5:high"
+    "judge": "anthropic/claude-opus-5-5:high",
+    "review": "anthropic/claude-sonnet-5-5",
+    "audit": "anthropic/claude-sonnet-5-5:high",
+    "auditRate": 0.1
   }
 }

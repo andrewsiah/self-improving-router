@@ -3,17 +3,19 @@
 
   router.py dual-run --repo DIR --task FILE --check CMD [--timeout SECONDS]
       Runs the task on the two models in FILE ({"prompt": ..., "models": [A, B]}, written by the extension), each in
-      its own git worktree from HEAD. Then runs the check in each, has the judge model compare the two diffs blind,
-      appends one row to dual-runs.jsonl and prints the winning worktree as the last line.
+      its own git worktree from HEAD. Then, cheapest signal first: runs the check in each; runs each worker's new tests
+      against the other (cross-tests); optionally has dual.review count each side's P1s blind; has dual.judge compare
+      the diffs blind twice with the order swapped (disagreement is a tie, "discordant"); and at dual.auditRate has
+      dual.audit judge the pair too. Appends one row to dual-runs.jsonl and prints the winning worktree as the last line.
   router.py report
-      Per model: dual runs, judged runs, win %, check pass %, P1s, cost and minutes per run.
+      Per model: dual runs, judged runs, win %, check pass %, P1s, cost and minutes per run; judge agreement.
   router.py outcomes [--since ISO-DATE] [--jsonl]
       Route decisions joined with how each run went (needs the pi-subagents run artifacts).
 
 Config and state live in $SELF_IMPROVING_ROUTER_DIR (default ~/.pi/agent/self-improving-router).
 $SELF_IMPROVING_ROUTER_PI overrides the pi binary.
 """
-import argparse, calendar, fcntl, json, os, random, re, signal, subprocess, sys, time
+import argparse, calendar, fcntl, hashlib, json, os, random, re, shutil, signal, subprocess, sys, time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -26,7 +28,7 @@ WORKER_NOTE = ("You are working in a git worktree at {cwd}, one of two independe
                "inside it, and install dependencies there if the task needs them. Leave your changes uncommitted: no "
                "commits, pushes or branch changes, and nothing outside this directory. Finish the task, run the "
                "relevant tests, then reply with a short summary.")
-JUDGE_PROMPT = """Blind review. Two independent attempts at the same coding task, labelled A and B, both started from \
+REVIEW_PROMPT = """Blind review. Two independent attempts at the same coding task, labelled A and B, both started from \
 commit {base}. Judge only the work; do not try to work out who or what wrote each one.
 
 Task given to both:
@@ -37,11 +39,33 @@ Task given to both:
 Check command, run in each worktree after the attempt: {check}
 {lines}
 
-Read both diffs, and the worktrees if you need context. Do not modify anything. Decide which diff better does the task: \
-correctness, completeness, scope, tests, simplicity. List each side's P1s (a bug that breaks behaviour, data loss, a \
-security hole, or a missed requirement), not style nits.
+Read both diffs, and the worktrees if you need context. Do not modify anything. List each side's P1s (a bug that breaks \
+behaviour, data loss, a security hole, or a missed requirement), not style nits.
 End your reply with exactly one line of JSON and nothing after it:
-{{"preferred": "A" or "B" or "tie", "p1": {{"A": ["file:line - issue"], "B": []}}, "why": "one sentence"}}"""
+{{"p1": {{"A": ["file:line - issue"], "B": []}}, "why": "one sentence"}}"""
+JUDGE_PROMPT = """Blind pairwise review. Two independent attempts at the same coding task, labelled Candidate 1 and \
+Candidate 2, both started from commit {base}. Judge only the work; do not try to work out who or what wrote each one.
+
+Task given to both:
+<<<
+{prompt}
+>>>
+
+Check command, run in each worktree after the attempt: {check}
+{lines}
+
+Read both diffs, and the worktrees if you need context. Do not modify anything. Decide which candidate better does the \
+task: correctness, completeness, scope, tests, simplicity.
+End your reply with exactly one line of JSON and nothing after it:
+{{"preferred": "1" or "2" or "same", "why": "one sentence"}}"""
+# Paths that count as an arm's new tests for the cross-tests: test dirs, conftest.py and test-named files.
+TEST_PATH = re.compile(r"(^|/)(tests?|__tests__|specs?|e2e|fixtures?)/|(^|/)conftest\.py$|"
+                       r"(^|/)(test_[^/]*|[^/]*(_test|\.test|\.spec|_spec))\.(py|[cm]?[jt]sx?|go|rs|rb|sh)$", re.I)
+# Winner rule: the first step where the arms differ decides (lower is better); a tie there goes to the next step.
+STEPS = (("finished", lambda a, verdict: a["exit"] != 0), ("check", lambda a, verdict: not a["pass"]),
+         ("cross", lambda a, verdict: a["cross"]["pass"] is False), ("p1s", lambda a, verdict: len(a["p1s"])),
+         ("judge", lambda a, verdict: a["label"] != verdict), ("cost", lambda a, verdict: a["cost"]),
+         ("minutes", lambda a, verdict: a["minutes"]))
 
 
 def sh(args, **kw):
@@ -92,6 +116,15 @@ def session_usage(sessions):
     return tokens, round(cost, 4)
 
 
+def run_check(check, cwd):
+    """(passed, output) of the check command in cwd."""
+    try:
+        c = subprocess.run(["bash", "-c", check], cwd=cwd, capture_output=True, text=True, timeout=600)
+        return c.returncode == 0, c.stdout + c.stderr
+    except subprocess.TimeoutExpired:
+        return False, "check timed out"
+
+
 def run_arm(arm, prompt, check, base, timeout, rundir, sub):
     """One worker in its worktree, then the check and the diff. Fills in and returns arm."""
     wt = Path(arm["worktree"])
@@ -103,11 +136,7 @@ def run_arm(arm, prompt, check, base, timeout, rundir, sub):
                              "--append-system-prompt", WORKER_NOTE.format(cwd=cwd)], prompt, cwd, timeout)
     arm["minutes"] = round((time.time() - t0) / 60, 1)
     arm["tokens"], arm["cost"] = session_usage(rundir / f"{arm['label']}-sessions")
-    try:
-        c = subprocess.run(["bash", "-c", check], cwd=cwd, capture_output=True, text=True, timeout=600)
-        arm["pass"], out = c.returncode == 0, c.stdout + c.stderr
-    except subprocess.TimeoutExpired:
-        arm["pass"], out = False, "check timed out"
+    arm["pass"], out = run_check(check, cwd)
     (rundir / f"{arm['label']}.check.txt").write_text(out[-20000:])
     sh(["git", "-C", str(wt), "add", "-A", "-N", "--", ".", ":(exclude)node_modules"])
     diff = sh(["git", "-C", str(wt), "diff", "--binary", base, "--", ".", ":(exclude)node_modules"]).stdout
@@ -116,32 +145,97 @@ def run_arm(arm, prompt, check, base, timeout, rundir, sub):
     return arm
 
 
-def parse_verdict(text):
+def json_lines(text):
+    """The JSON objects on a reply's lines, last first."""
     for line in reversed(text.strip().splitlines()):
         line = line.strip().strip("`")
-        if not line.startswith("{"): continue
-        try: v = json.loads(line)
-        except ValueError: continue
-        if isinstance(v, dict) and v.get("preferred") in ("A", "B", "tie"):
-            p1 = v.get("p1") if isinstance(v.get("p1"), dict) else {}
-            return {"preferred": v["preferred"], "p1": {k: [str(x) for x in p1.get(k) or []] for k in ("A", "B")},
-                    "why": str(v.get("why", ""))[:300]}
+        if line.startswith("{"):
+            try: v = json.loads(line)
+            except ValueError: continue
+            if isinstance(v, dict): yield v
+
+
+def parse_verdict(text):
+    """A review reply's P1 lists: {"p1": {"A": [...], "B": [...]}, "why": str}, or None."""
+    for v in json_lines(text):
+        if isinstance(v.get("p1"), dict):
+            return {"p1": {k: [str(x) for x in v["p1"].get(k) or []] for k in ("A", "B")}, "why": str(v.get("why", ""))[:300]}
     return None
 
 
-def judge(model, arms, prompt, check, base, rundir):
-    lines = "\n".join(f"{a['label']}: check {'PASSED' if a['pass'] else 'FAILED'} (output: {rundir / (a['label'] + '.check.txt')}); "
+def read_only_pi(model, text, rundir, name):
+    """One read-only pi call. Returns (reply or None if the call failed, cost)."""
+    sessions = rundir / f"{name}-sessions"
+    code, out = run_pi(["-p", "--model", model, "--tools", "read,grep,find,ls", "--session-dir", str(sessions)], text, rundir, 1800)
+    (rundir / f"{name}.txt").write_text(out)
+    return (out if code == 0 else None), session_usage(sessions)[1]
+
+
+def arm_lines(arms, rundir, numbered):
+    """One line per arm for a judge prompt: check results and the paths of its output and diff."""
+    cross = lambda a: "FAILED" if a["cross"]["pass"] is False else "PASSED" if a["cross"]["ran"] else "none added"
+    return "\n".join(f"{f'Candidate {n}' if numbered else a['label']}: check {'PASSED' if a['pass'] else 'FAILED'} "
+                      f"(output: {rundir / (a['label'] + '.check.txt')}); check with the other side's new tests added: {cross(a)}; "
                       f"diff {rundir / (a['label'] + '.diff')} ({a['diffLines']} lines); worktree {a['worktree']}"
-                      for a in sorted(arms, key=lambda a: a["label"]))
-    text = JUDGE_PROMPT.format(base=base[:12], prompt=prompt, check=check, lines=lines)
-    code, out = run_pi(["-p", "--model", model, "--tools", "read,grep,find,ls", "--no-session"], text, rundir, 1800)
-    (rundir / "judge.txt").write_text(out)
-    return parse_verdict(out) if code == 0 else None
+                      for n, a in enumerate(arms, 1))
 
 
-def pick_winner(arms):
-    """A worker that finished first, then a passing check, fewer P1s, the judge's preference, lower cost."""
-    return min(arms, key=lambda a: (a["exit"] != 0, not a["pass"], len(a["p1s"]), not a.get("preferred"), a["cost"]))
+def review(model, arms, prompt, check, base, rundir):
+    """Blind review of both diffs for P1s (A and B are the arm labels). Returns (verdict or None, cost)."""
+    text = REVIEW_PROMPT.format(base=base[:12], prompt=prompt, check=check, lines=arm_lines(sorted(arms, key=lambda a: a["label"]), rundir, False))
+    out, cost = read_only_pi(model, text, rundir, "review")
+    return (parse_verdict(out) if out else None), cost
+
+
+def judge(model, arms, prompt, check, base, rundir, name="judge"):
+    """Pairwise judge asked twice with the candidate order swapped, which cancels position bias. Returns
+    ({"model", "answers", "verdict"}, cost). verdict is "A" or "B" when both orders agree on it, "same" when both say
+    so, "discordant" when they disagree, and None when a call failed (a failed call must not fake a tie)."""
+    answers, cost = [], 0.0
+    for i, order in enumerate((arms, arms[::-1]), 1):
+        text = JUDGE_PROMPT.format(base=base[:12], prompt=prompt, check=check, lines=arm_lines(order, rundir, True))
+        out, c = read_only_pi(model, text, rundir, f"{name}{i}")
+        cost += c
+        pick = next((v["preferred"] for v in json_lines(out or "") if v.get("preferred") in ("1", "2", "same")), None)
+        answers.append(order[int(pick) - 1]["label"] if pick in ("1", "2") else pick)
+    verdict = None if None in answers else answers[0] if answers[0] == answers[1] else "discordant"
+    return {"model": model, "answers": answers, "verdict": verdict}, round(cost, 4)
+
+
+def cross_test(arm, rival, check, base, rundir, sub):
+    """Runs the check in arm's worktree with the test files the rival added or changed copied in, then restores the
+    worktree. Returns {"files": n, "ran": bool, "pass": bool or None}. A copy error skips the step so it cannot decide the pair."""
+    names = sh(["git", "-C", rival["worktree"], "diff", "--name-only", "--diff-filter=AM", base, "--", ".", ":(exclude)node_modules"]).stdout
+    files = [f for f in names.splitlines() if TEST_PATH.search(f)]
+    rec = {"files": len(files), "ran": False, "pass": None}
+    if not files: return rec
+    wt, saved, added = Path(arm["worktree"]), {}, []
+    try:
+        for rel in files:
+            dst = wt / rel
+            if dst.exists(): saved[rel] = dst.read_bytes()
+            else: added.append(dst)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(Path(rival["worktree"]) / rel, dst)
+        rec["pass"], out = run_check(check, wt / sub)
+        rec["ran"] = True
+        (rundir / f"{arm['label']}.cross.txt").write_text(out[-20000:])
+    except OSError as e:
+        rec["skip"] = str(e)[:200]
+    finally:
+        for dst in added: dst.unlink(missing_ok=True)
+        for rel, data in saved.items(): (wt / rel).write_bytes(data)
+    return rec
+
+
+def pick_winner(arms, verdict):
+    """The arm that is better at the first step of STEPS where they differ; verdict is the judge's verdict."""
+    return min(arms, key=lambda a: tuple(f(a, verdict) for _, f in STEPS))
+
+
+def decided_by(win, other, verdict):
+    """The first step of STEPS where `other` is worse than the winner, or "tie"."""
+    return next((name for name, f in STEPS if f(other, verdict) > f(win, verdict)), "tie")
 
 
 def max_pairs():
@@ -192,19 +286,30 @@ def dual_run(args):
     with ThreadPoolExecutor(2) as ex:
         list(ex.map(lambda a: run_arm(a, prompt, args.check, base, args.timeout, rundir, sub), arms))
     ran = [a for a in arms if a["exit"] == 0]
-    judge_model = ((read_json(STATE / "routing.json") or {}).get("dual") or {}).get("judge") or models[0]
-    verdict = judge(judge_model, arms, prompt, args.check, base, rundir) if ran else None
+    dual = (read_json(STATE / "routing.json") or {}).get("dual") or {}
+    cost, review_v, jury, audit = 0.0, None, None, None
+    if len(ran) == 2:  # a worker that did not finish loses at once; no judging
+        for a in arms: a["cross"] = cross_test(a, next(b for b in arms if b is not a), args.check, base, rundir, sub)
+        if dual.get("review"):
+            review_v, c = review(dual["review"], arms, prompt, args.check, base, rundir); cost += c
+        jury, c = judge(dual.get("judge") or models[0], arms, prompt, args.check, base, rundir); cost += c
+        if dual.get("audit") and int(hashlib.sha256(rid.encode()).hexdigest()[:8], 16) / 0xFFFFFFFF < float(dual.get("auditRate", 0.1)):
+            audit, c = judge(dual["audit"], arms, prompt, args.check, base, rundir, "audit"); cost += c
+            audit["agree"] = None if None in (jury["verdict"], audit["verdict"]) else audit["verdict"] == jury["verdict"]
+    verdict = jury and jury["verdict"]
     for a in arms:
-        a["p1s"] = verdict["p1"][a["label"]] if verdict else []
-        a["preferred"] = bool(verdict) and verdict["preferred"] == a["label"]
-    win = pick_winner(arms)
+        a.setdefault("cross", {"files": 0, "ran": False, "pass": None})
+        a["p1s"] = review_v["p1"][a["label"]] if review_v else []
+    win = pick_winner(arms, verdict)
+    other = next(a for a in arms if a is not win)
     route = task.get("route") or {}
     row = {"at": time.strftime("%FT%TZ", time.gmtime()), "id": rid, "repo": repo.name, "base": base, "check": args.check,
            "models": models, "arm": task.get("arm"), "tier": route.get("tier"), "type": route.get("type"),
            "unsure": route.get("unsure"), "minutes": route.get("minutes"), "tokens": route.get("tokens"),
-           "judge": judge_model, "judged": bool(verdict), "preferred": next((a["model"] for a in arms if a["preferred"]), None),
-           "why": verdict and verdict["why"], "winner": win["model"] if ran else None,
-           "results": {a["model"]: {k: a[k] for k in ("label", "exit", "pass", "p1s", "tokens", "cost", "minutes", "diffLines", "worktree")}
+           "judge": jury, "audit": audit, "review": review_v, "judged": verdict is not None, "judgeCost": round(cost, 4),
+           "preferred": next((a["model"] for a in arms if a["label"] == verdict), None),
+           "winner": win["model"] if ran else None, "decidedBy": decided_by(win, other, verdict) if len(ran) == 2 else "finished",
+           "results": {a["model"]: {k: a[k] for k in ("label", "exit", "pass", "cross", "p1s", "tokens", "cost", "minutes", "diffLines", "worktree")}
                        for a in arms},
            "wall": round((time.time() - t0) / 60, 1)}
     with RESULTS.open("a") as f: f.write(json.dumps(row) + "\n")
@@ -215,8 +320,11 @@ def dual_run(args):
         return 3
     lose = next(a for a in arms if a is not win)
     for a in arms:
-        print(f"  {a['label']} {a['model']}: exit={a['exit']} pass={a['pass']} P1s={len(a['p1s'])} ${a['cost']:.3f} {a['minutes']} min", file=sys.stderr)
-    print(f"self-improving-router: winner {win['model']}. Its diff is uncommitted in the worktree below; the other diff is saved at "
+        x = a["cross"]
+        print(f"  {a['label']} {a['model']}: exit={a['exit']} check={'pass' if a['pass'] else 'FAIL'} "
+              f"cross={'-' if not x['ran'] else 'pass' if x['pass'] else 'FAIL'} P1s={len(a['p1s'])} ${a['cost']:.3f} {a['minutes']} min", file=sys.stderr)
+    audit_note = f"audit {'agreed' if audit['agree'] else 'unknown' if audit['agree'] is None else 'DISAGREED'}" if audit else "no audit"
+    print(f"self-improving-router: judge {verdict} ({audit_note}), decided by {row['decidedBy']}; winner {win['model']}. Its diff is uncommitted in the worktree below; the other diff is saved at "
           f"{rundir / (lose['label'] + '.diff')}. Remove the other worktree: {remove(repo, lose['worktree'])}", file=sys.stderr)
     print(win["worktree"])
     return 0 if win["pass"] else 1
@@ -237,6 +345,11 @@ def report(_args):
         n, j = s["runs"], s["judged"]
         win = f"{100 * s['wins'] / j:5.0f}" if j else f"{'-':>5}"
         print(f"{model:44} {n:4d} {j:6d} {win} {100 * s['pass'] / n:6.0f} {s['p1s'] / n:6.2f} {s['cost'] / n:7.3f} {s['minutes'] / n:7.1f}")
+    judged = [r for r in rows if r.get("judged")]
+    audits = [r["audit"]["agree"] for r in rows if r.get("audit") and r["audit"]["agree"] is not None]
+    print(f"judge: {sum((r['judge'] or {}).get('verdict') == 'discordant' for r in rows)} discordant, "
+          f"{sum(r['decidedBy'] in ('cost', 'minutes') for r in judged)}/{len(judged)} judged runs decided by cost or time; "
+          f"audit agreed {sum(audits)}/{len(audits)}")
     return 0
 
 
