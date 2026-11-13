@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
-import { isAvailable, launchChildren, pairPlan, parseRoute, registerRouter, routeFor } from "../extensions/router.ts";
+import { effectiveRate, isAvailable, launchChildren, pairPlan, parseRoute, registerRouter, routeFor } from "../extensions/router.ts";
 
 const CONFIG = {
   agents: ["worker", "coder"],
@@ -14,14 +14,14 @@ const CONFIG = {
 const ROUTE = "route: tier: standard - normal fix | type: code | minutes: 20 | tokens: 15k | unsure: no";
 const registry = { find: (provider: string, id: string) => provider === "p" && id !== "gone" ? { id } : undefined, hasConfiguredAuth: () => true };
 
-function setup(config: object | null = CONFIG, rand = () => 0.99) {
+function setup(config: object | null = CONFIG, rand = () => 0.99, rateFor = async (_dir: string, _answers: any, base: number) => base) {
   const dir = mkdtempSync(path.join(tmpdir(), "sir-test-"));
   if (config) writeFileSync(path.join(dir, "routing.json"), JSON.stringify(config));
   const repo = path.join(dir, "repo");
   mkdirSync(repo);
   execFileSync("git", ["init", "-q", repo]);
   const handlers: Record<string, Function> = {};
-  registerRouter({ on: (name: string, fn: Function) => { handlers[name] = fn; } }, { SELF_IMPROVING_ROUTER_DIR: dir }, () => Date.parse("2026-11-13T10:00:00Z"), rand);
+  registerRouter({ on: (name: string, fn: Function) => { handlers[name] = fn; } }, { SELF_IMPROVING_ROUTER_DIR: dir }, () => Date.parse("2026-11-13T10:00:00Z"), rand, rateFor);
   const ctx = { cwd: repo, modelRegistry: registry, sessionManager: { getSessionId: () => "s1", getSessionFile: () => path.join(dir, "s", "x.jsonl") } };
   const call = (input: any, id = "c1") => handlers.tool_call({ toolName: "subagent", toolCallId: id, input }, ctx);
   const rows = (file = "decisions.jsonl") => { try { return readFileSync(path.join(dir, file), "utf8").trim().split("\n").map(l => JSON.parse(l)); } catch { return []; } };
@@ -75,6 +75,30 @@ test("pairPlan: unsure always pairs, others at the rate, never non-code or side 
   for (const words of ["then deploy it", "git -C . push origin HEAD", "send a chat message to the team", "rotate the access token", "revoke old API tokens"])
     assert.equal(pairPlan(CONFIG, route("tier: standard | type: code | unsure: yes"), "p/mid", words), null, words);
   assert.equal(pairPlan(CONFIG, route("tier: hard | type: code | unsure: yes"), "p/mid", "x"), null); // partner is the same model
+});
+
+test("pairPlan draws unsure launches at the rate it is given", () => {
+  const unsure = parseRoute("tier: standard | type: code | unsure: yes")!;
+  assert.equal(pairPlan(CONFIG, unsure, "p/mid", "x", () => 0.5, 0.25), null);
+  assert.equal(pairPlan(CONFIG, unsure, "p/mid", "x", () => 0.1, 0.25)?.arm, "unsure");
+});
+
+test("a launch is paired at the rate router.py rate gives, and a failed lookup never pairs", async () => {
+  const task = "route: tier: standard - x | type: code | unsure: yes\nFix it.";
+  const asked: any[] = [];
+  const low = setup(CONFIG, () => 0.5, async (_dir, answers, base) => { asked.push([answers.tier, answers.type, base]); return 0.02; });
+  assert.equal(await low.call({ agent: "worker", task }), undefined); // drawn 0.5 against 0.02
+  assert.deepEqual(asked, [["standard", "code", 1]]);
+  assert.equal(low.rows()[0].dual, undefined);
+  const full = setup(CONFIG, () => 0.5, async (_dir, _answers, base) => base);
+  assert.equal((await full.call({ agent: "worker", task })).block, true);
+  const none = setup(CONFIG, () => 0, async () => 0);
+  assert.equal(await none.call({ agent: "worker", task }), undefined);
+});
+
+test("effectiveRate asks router.py rate: no savings data halves a base rate to 1/64", async () => {
+  const { dir } = setup();
+  assert.equal(await effectiveRate(dir, parseRoute("tier: standard | type: code")!, 1), 1 / 64);
 });
 
 test("without routing.json nothing is blocked or logged", async () => {

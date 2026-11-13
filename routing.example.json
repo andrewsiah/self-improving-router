@@ -7,6 +7,9 @@
     "hard": ["anthropic/claude-opus-5-5:high"],
     "*/research": ["anthropic/claude-sonnet-5-5"]
   },
+  "prices": {
+    "claude-opus-5-5": { "input": 4, "output": 20, "cacheRead": 0.2, "cacheWrite": 5 }
+  },
   "dual": {
     "rate": 0.1,
     "maxPairs": 3,

@@ -11,6 +11,10 @@
       Per model: dual runs, judged runs, win %, check pass %, P1s, cost and minutes per run; judge agreement.
   router.py outcomes [--since ISO-DATE] [--jsonl]
       Route decisions joined with how each run went (needs the pi-subagents run artifacts).
+  router.py rate --tier T --type Y --base R
+      The sampling rate the extension uses for a launch whose base rate is R (1 for unsure: yes, else dual.rate):
+      R, or 0.02 once the tier/type cell's last 30 dual runs all held up under the same model list in routing.json,
+      then halved while the last 7 days' eval overhead exceeds 10% of the savings (or savings are 0).
 
 Config and state live in $SELF_IMPROVING_ROUTER_DIR (default ~/.pi/agent/self-improving-router).
 $SELF_IMPROVING_ROUTER_PI overrides the pi binary.
@@ -24,6 +28,13 @@ STATE = Path(os.environ.get("SELF_IMPROVING_ROUTER_DIR") or AGENT_DIR / "self-im
 RESULTS = STATE / "dual-runs.jsonl"
 PI = os.environ.get("SELF_IMPROVING_ROUTER_PI", "pi")
 TIERS = ("light", "standard", "hard")
+# Evaluate less over time: a cell (tier/type) whose routed pick held up in its last DECAY_PAIRS dual runs samples at
+# FLOOR_RATE; a miss or a changed model list in routing.json puts it back at its base rate. Eval overhead over a
+# trailing BUDGET_DAYS days may not exceed BUDGET_SHARE of the savings routing made; past that every rate halves
+# (at most MAX_HALVINGS times). The audit rate drops to AUDIT_FLOOR once AUDIT_TRUST_PAIRS audits agree at AUDIT_TRUST_AGREE.
+DECAY_PAIRS, FLOOR_RATE = 30, 0.02
+BUDGET_DAYS, BUDGET_SHARE, MAX_HALVINGS = 7, 0.10, 6
+AUDIT_FLOOR, AUDIT_TRUST_PAIRS, AUDIT_TRUST_AGREE = 0.02, 40, 0.9
 WORKER_NOTE = ("You are working in a git worktree at {cwd}, one of two independent attempts at this task. Work only "
                "inside it, and install dependencies there if the task needs them. Leave your changes uncommitted: no "
                "commits, pushes or branch changes, and nothing outside this directory. Finish the task, run the "
@@ -285,6 +296,7 @@ def dual_run(args):
     if not claim_slot(rundir):
         print(f"self-improving-router: {max_pairs()} dual runs already in flight; run a single worker instead", file=sys.stderr)
         return 3
+    config = read_json(STATE / "routing.json") or {}  # as of launch: a routing edit while workers run must not relabel this run's cell
     labels = ["A", "B"]; random.shuffle(labels)  # blind: which model is A is random per run
     arms = []
     for model, label in zip(models, labels):
@@ -297,7 +309,7 @@ def dual_run(args):
     with ThreadPoolExecutor(2) as ex:
         list(ex.map(lambda a: run_arm(a, prompt, args.check, base, args.timeout, rundir, sub), arms))
     ran = [a for a in arms if a["exit"] == 0]
-    dual = (read_json(STATE / "routing.json") or {}).get("dual") or {}
+    dual = config.get("dual") or {}
     cost, review_v, jury, audit = 0.0, None, None, None
     if len(ran) == 2:  # a worker that did not finish loses at once; no judging
         for a in arms: a["cross"] = cross_test(a, next(b for b in arms if b is not a), args.check, base, rundir, sub)
@@ -305,21 +317,25 @@ def dual_run(args):
             for a in arms: a["cross"]["void"] = True
         if dual.get("review"):
             review_v, c = review(dual["review"], arms, prompt, args.check, base, rundir); cost += c
-        jury, c = judge(dual.get("judge") or models[0], arms, prompt, args.check, base, rundir); cost += c
-        if dual.get("audit") and int(hashlib.sha256(rid.encode()).hexdigest()[:8], 16) / 0xFFFFFFFF < float(dual.get("auditRate", 0.1)):
-            audit, c = judge(dual["audit"], arms, prompt, args.check, base, rundir, "audit"); cost += c
-            audit["agree"] = None if None in (jury["verdict"], audit["verdict"]) else audit["verdict"] == jury["verdict"]
+        for a in arms: a["p1s"] = review_v["p1"][a["label"]] if review_v else []
+        early = pick_winner(arms, None)  # the judge only breaks ties: skip it when the steps before it already decide
+        if decided_by(early, next(a for a in arms if a is not early), None) not in ("finished", "check", "cross", "p1s"):
+            jury, c = judge(dual.get("judge") or models[0], arms, prompt, args.check, base, rundir); cost += c
+            if dual.get("audit") and int(hashlib.sha256(rid.encode()).hexdigest()[:8], 16) / 0xFFFFFFFF < audit_rate(dual, dual["audit"], jury["model"]):
+                audit, c = judge(dual["audit"], arms, prompt, args.check, base, rundir, "audit"); cost += c
+                audit["agree"] = None if None in (jury["verdict"], audit["verdict"]) else audit["verdict"] == jury["verdict"]
     verdict = jury and jury["verdict"]
-    for a in arms:
-        a.setdefault("cross", {"files": 0, "ran": False, "pass": None})
-        a["p1s"] = review_v["p1"][a["label"]] if review_v else []
+    for a in arms: a.setdefault("cross", {"files": 0, "ran": False, "pass": None})
     win = pick_winner(arms, verdict)
     other = next(a for a in arms if a is not win)
     route = task.get("route") or {}
     row = {"at": time.strftime("%FT%TZ", time.gmtime()), "id": rid, "repo": repo.name, "base": base, "check": args.check,
            "models": models, "arm": task.get("arm"), "tier": route.get("tier"), "type": route.get("type"),
            "unsure": route.get("unsure"), "minutes": route.get("minutes"), "tokens": route.get("tokens"),
-           "judge": jury, "audit": audit, "review": review_v, "judged": verdict is not None, "judgeCost": round(cost, 4),
+           "cell": cell_of(route.get("tier"), route.get("type")), "cellModels": cell_models(config, route.get("tier"), route.get("type")),
+           "judge": jury, "audit": audit, "review": review_v, "judgeCost": round(cost, 4),
+           "judged": len(ran) == 2 and (jury is None or verdict is not None),  # decided by evidence, not by cost alone or a missing answer
+           "overhead": round(arms[1]["cost"] + cost, 4),  # the partner (arms[1]) is the extra arm plus review, judge and audit
            "preferred": next((a["model"] for a in arms if a["label"] == verdict), None),
            "winner": win["model"] if ran else None, "decidedBy": decided_by(win, other, verdict) if len(ran) == 2 else "finished",
            "results": {a["model"]: {k: a[k] for k in ("label", "exit", "pass", "cross", "p1s", "tokens", "cost", "minutes", "diffLines", "worktree")}
@@ -352,6 +368,7 @@ def report(_args):
             s["runs"] += 1; s["pass"] += bool(a["pass"]); s["p1s"] += len(a["p1s"])
             s["cost"] += a["cost"]; s["minutes"] += a["minutes"]
             if r.get("judged"): s["judged"] += 1; s["wins"] += r["winner"] == model
+    print(budget_line(budget(read_json(STATE / "routing.json") or {})))
     print(f"{len(rows)} dual runs; win % counts judged runs only")
     print(f"{'model':44} {'runs':>4} {'judged':>6} {'win%':>5} {'pass%':>6} {'P1/run':>6} {'$/run':>7} {'min/run':>7}")
     for model, s in sorted(stats.items()):
@@ -371,6 +388,15 @@ def model_id(spec):
     return re.sub(r":\w+$", "", spec or "").split("/")[-1].lower()
 
 
+def run_meta(run, decision):
+    """The pi-subagents meta artifact of a launch (its run row from runs.jsonl), or None."""
+    if run.get("run_id") and run.get("artifacts"):
+        for name in (f"{run['run_id']}_{decision['agent']}_{decision['index']}_meta.json", f"{run['run_id']}_{decision['agent']}_meta.json"):
+            meta = read_json(Path(run["artifacts"]) / name)
+            if meta: return meta
+    return None
+
+
 def join_outcomes(since=""):
     """Routed and explicit launches with what the run left behind: run id from runs.jsonl, then the pi-subagents
     `<run>_<agent>[_<index>]_meta.json` artifact (exit code, error, output tokens, end time). retried: a later launch
@@ -382,11 +408,7 @@ def join_outcomes(since=""):
     out = []
     for i, r in enumerate(rows):
         run = runs.get(r.get("call")) or {}
-        meta = None
-        if run.get("run_id") and run.get("artifacts"):
-            for name in (f"{run['run_id']}_{r['agent']}_{r['index']}_meta.json", f"{run['run_id']}_{r['agent']}_meta.json"):
-                meta = read_json(Path(run["artifacts"]) / name)
-                if meta: break
+        meta = run_meta(run, r)
         later = [x for x in rows[i + 1:] if r.get("task_hash") and x.get("task_hash") == r["task_hash"]
                  and x.get("session") == r.get("session") and x.get("call") != r.get("call")]
         ended = meta.get("timestamp") if meta and isinstance(meta.get("timestamp"), (int, float)) else None
@@ -425,6 +447,112 @@ def outcomes(args):
     return 0
 
 
+def cell_of(tier, type_):
+    return f"{tier}/{type_}" if tier and type_ else None
+
+
+def cell_models(config, tier, type_):
+    """The model list routing.json gives a tier/type: the first of `tier/type`, `*/type`, `tier` that has models."""
+    routes = config.get("routes") if isinstance(config.get("routes"), dict) else {}
+    for key in (type_ and f"{tier}/{type_}", type_ and f"*/{type_}", tier):
+        v = routes.get(key) if key else None
+        models = [m.strip() for m in (v if isinstance(v, list) else [v]) if isinstance(m, str) and m.strip()]
+        if models: return models
+    return None
+
+
+def held_up(row):
+    """The routed pick (models[0]) won or tied the dual run (a cost or time decision is a tie) and is not a
+    confident_wrong (unsure: no and its own check failed) or smart_needed (its check failed, the partner's passed)."""
+    routed, partner = row["models"]
+    res = row["results"]
+    lost = row.get("winner") != routed and row.get("decidedBy") not in ("tie", "cost", "minutes")
+    failed = res[routed].get("pass") is False
+    return not (lost or failed and (row.get("unsure") is False or res[partner].get("pass") is True))
+
+
+def cell_streak(rows, cell, models):
+    """Consecutive held-up dual runs at the end of the log for this cell under this model list. A miss (including a routed
+    pick that did not finish while its partner did), or a run logged under another list (a model joined or left), ends
+    the streak. Runs where the partner did not finish, or the routed pick finished but the judge never answered, say nothing."""
+    n = 0
+    for r in reversed(rows):
+        if r.get("cell") != cell or not isinstance(r.get("results"), dict): continue
+        routed, partner = (r["results"].get(m, {}) for m in r["models"])
+        if partner.get("exit") != 0 or routed.get("exit") == 0 and not r.get("judged"): continue
+        if r.get("cellModels") != models or not held_up(r): break
+        n += 1
+    return n
+
+
+def savings(since, config):
+    """(savings in $, launches counted): for each routed launch since `since` that left usage in its run meta, the same
+    tokens at the top model's list price (the first `hard` model, priced in routing.json `prices`, $ per million tokens
+    keyed by model id) minus the cost the run logged. Free models log $0. No top-model price: (0, 0)."""
+    hard = (config.get("routes") or {}).get("hard") or []
+    top = model_id(hard[0]) if hard else None
+    price = {model_id(k): v for k, v in (config.get("prices") or {}).items() if isinstance(v, dict)}.get(top)
+    if not price: return 0.0, 0
+    runs = {r.get("call"): r for r in read_jsonl(STATE / "runs.jsonl")}
+    total, n = 0.0, 0
+    for d in read_jsonl(STATE / "decisions.jsonl"):
+        if d.get("outcome") != "routed" or d.get("ts", "")[:19] < since or model_id(d.get("model")) == top: continue
+        usage = (run_meta(runs.get(d.get("call")) or {}, d) or {}).get("usage")
+        if not isinstance(usage, dict): continue
+        would = sum((usage.get(k) or 0) * (price.get(k) or 0) for k in ("input", "output", "cacheRead", "cacheWrite")) / 1e6
+        total += would - (usage.get("cost") or 0); n += 1
+    return total, n
+
+
+def row_overhead(row):
+    """A dual run's overhead; rows from before it was logged get the partner's cost plus judgeCost."""
+    if "overhead" in row: return row["overhead"] or 0
+    return ((row.get("results") or {}).get((row.get("models") or [None, None])[1]) or {}).get("cost", 0) + (row.get("judgeCost") or 0)
+
+
+def budget(config):
+    """The trailing-week eval budget: savings, routed launches counted, overhead (dual runs' extra arm, review, judge and
+    audit at list price), dual runs, and how many times every rate halves until overhead is within BUDGET_SHARE of savings
+    (all MAX_HALVINGS when savings are 0 or unknown)."""
+    since = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() - BUDGET_DAYS * 86400))
+    rows = [r for r in read_jsonl(RESULTS) if str(r.get("at", ""))[:19] >= since]
+    overhead = sum(row_overhead(r) for r in rows)
+    saved, launches = savings(since, config)
+    n = 0
+    while n < MAX_HALVINGS and (saved <= 0 or overhead / 2 ** n > BUDGET_SHARE * saved): n += 1
+    return {"savings": saved, "launches": launches, "overhead": overhead, "pairs": len(rows), "halvings": n}
+
+
+def budget_line(b):
+    pct = f"{100 * b['overhead'] / b['savings']:.0f}%" if b["savings"] > 0 else "n/a"
+    return (f"eval budget {BUDGET_DAYS} d: savings ${b['savings']:.2f} ({b['launches']} routed launches), overhead ${b['overhead']:.2f} "
+            f"({b['pairs']} dual runs), net ${b['savings'] - b['overhead']:.2f}, overhead {pct} of savings (limit {100 * BUDGET_SHARE:.0f}%)"
+            + (f"; every rate halved {b['halvings']}x" if b["halvings"] else "")
+            + ("" if b["launches"] else "; insufficient data: needs routing.json prices for the hard route's first model and routed launches with usage"))
+
+
+def sampling_rate(config, tier, type_, base):
+    """base, or FLOOR_RATE once the cell's last DECAY_PAIRS dual runs held up, then halved per the eval budget."""
+    cell, models = cell_of(tier, type_), cell_models(config, tier, type_)
+    rate = FLOOR_RATE if cell and models and base > FLOOR_RATE and cell_streak(read_jsonl(RESULTS), cell, models) >= DECAY_PAIRS else base
+    return rate / 2 ** budget(config)["halvings"]
+
+
+def audit_rate(dual, audit_model, judge_model):
+    """dual.auditRate (default 0.1), or AUDIT_FLOOR once the last AUDIT_TRUST_PAIRS audits by this judge and audit model
+    agree at AUDIT_TRUST_AGREE; halved like every rate when the eval budget is over."""
+    audited = [r["audit"]["agree"] for r in read_jsonl(RESULTS) if isinstance(r.get("audit"), dict) and r["audit"].get("agree") is not None
+               and r["audit"].get("model") == audit_model and (r.get("judge") or {}).get("model") == judge_model][-AUDIT_TRUST_PAIRS:]
+    rate = float(dual.get("auditRate", 0.1))
+    if len(audited) >= AUDIT_TRUST_PAIRS and sum(audited) >= AUDIT_TRUST_AGREE * len(audited): rate = min(rate, AUDIT_FLOOR)
+    return rate / 2 ** budget(read_json(STATE / "routing.json") or {})["halvings"]
+
+
+def rate(args):
+    print(sampling_rate(read_json(STATE / "routing.json") or {}, args.tier, args.type, args.base))
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="router.py", description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -432,9 +560,10 @@ def main(argv=None):
     d.add_argument("--repo", required=True); d.add_argument("--task", required=True); d.add_argument("--check", required=True)
     d.add_argument("--timeout", type=int, default=1800, help="seconds per worker (default 1800)")
     sub.add_parser("report")
+    q = sub.add_parser("rate"); q.add_argument("--tier", required=True); q.add_argument("--type", default=""); q.add_argument("--base", type=float, required=True)
     o = sub.add_parser("outcomes"); o.add_argument("--since", default=""); o.add_argument("--jsonl", action="store_true")
     args = ap.parse_args(argv)
-    return {"dual-run": dual_run, "report": report, "outcomes": outcomes}[args.cmd](args)
+    return {"dual-run": dual_run, "report": report, "rate": rate, "outcomes": outcomes}[args.cmd](args)
 
 
 if __name__ == "__main__":

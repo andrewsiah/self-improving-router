@@ -1,5 +1,5 @@
 """router.py with a fake pi: no model calls. Run: python3 -m unittest discover -s test"""
-import contextlib, importlib, io, json, os, shutil, subprocess, sys, tempfile, unittest
+import contextlib, importlib, io, json, os, shutil, subprocess, sys, tempfile, time, unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -35,7 +35,11 @@ print("done")
 """
 
 
-class DualRunTest(unittest.TestCase):
+TOP_OUTPUT_PRICE = 20.0  # $ per million output tokens for the hard route's first model, p/big
+
+
+class Fixture(unittest.TestCase):
+    """A scratch repo, state dir and fake pi."""
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.tmp, True)
@@ -47,6 +51,9 @@ class DualRunTest(unittest.TestCase):
         self.pr = importlib.reload(router)
         self.repo = self.tmp / "repo"
         git = lambda *a: subprocess.run(["git", "-C", str(self.repo), *a], check=True, capture_output=True)
+        self.routing = {"routes": {"hard": ["p/big:high"], "standard": ["p/free", "p/mid"]}, "prices": {"p/big": {"output": TOP_OUTPUT_PRICE}}}
+        self.configure()
+        self.seed_savings(100_000_000)  # a budget in big surplus; the budget tests reseed
         self.repo.mkdir(); git("init", "-q"); (self.repo / "README").write_text("x\n"); git("add", ".")
         git("-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", "init")
 
@@ -69,14 +76,27 @@ class DualRunTest(unittest.TestCase):
 
     def configure(self, **dual):
         (self.tmp / "state").mkdir(exist_ok=True)
-        (self.tmp / "state/routing.json").write_text(json.dumps({"dual": dual}))
+        (self.tmp / "state/routing.json").write_text(json.dumps(dict(self.routing, dual=dual)))
 
+    def seed_savings(self, output_tokens):
+        """One routed launch on the free model p/free whose run used `output_tokens` output tokens: it saved that many
+        tokens at p/big's price. Returns the savings in $."""
+        state = self.tmp / "state"; art = self.tmp / "art"; state.mkdir(exist_ok=True); art.mkdir(exist_ok=True)
+        ts = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
+        (state / "decisions.jsonl").write_text(json.dumps({"ts": ts, "call": "c", "index": 0, "agent": "worker", "model": "p/free", "outcome": "routed"}) + "\n")
+        (state / "runs.jsonl").write_text(json.dumps({"call": "c", "run_id": "r", "artifacts": str(art)}) + "\n")
+        (art / "r_worker_0_meta.json").write_text(json.dumps({"usage": {"output": output_tokens, "cost": 0}}))
+        return output_tokens * TOP_OUTPUT_PRICE / 1e6
+
+
+class DualRunTest(Fixture):
     def test_the_passing_preferred_model_wins(self):
         code, row = self.dual(["p/bad", "p/good"])
         self.assertEqual(code, 0)
-        self.assertEqual(row["winner"], "p/good"); self.assertEqual(row["preferred"], "p/good"); self.assertTrue(row["judged"])
+        self.assertEqual(row["winner"], "p/good"); self.assertTrue(row["judged"])
         self.assertEqual(row["id"], "20261113100000-abc123"); self.assertEqual(row["arm"], "unsure"); self.assertEqual(row["decidedBy"], "check")
-        self.assertEqual(row["judge"]["verdict"], row["results"]["p/good"]["label"]); self.assertEqual(row["judgeCost"], 0.02)  # two judge calls
+        self.assertIsNone(row["judge"]); self.assertEqual(row["judgeCost"], 0.0)  # the check decided it: no judge call
+        self.assertEqual((row["cell"], row["cellModels"]), ("standard/code", ["p/free", "p/mid"])); self.assertEqual(row["overhead"], 0.5)  # p/good, the partner, ran as the extra arm
         self.assertIsNone(row["review"]); self.assertIsNone(row["audit"])
         self.assertEqual(row["results"]["p/good"]["cost"], 0.5); self.assertFalse(row["results"]["p/bad"]["pass"])
         self.assertTrue((self.tmp / "state/runs/20261113100000-abc123/A.diff").exists())
@@ -113,7 +133,8 @@ class DualRunTest(unittest.TestCase):
         self.configure(review="p/rev")
         _, row = self.dual(["p/good", "p/bad"], "true")
         self.assertEqual((row["winner"], row["decidedBy"]), ("p/good", "p1s"))
-        self.assertEqual(len(row["results"]["p/bad"]["p1s"]), 1); self.assertEqual(row["judgeCost"], 0.03)
+        self.assertEqual(len(row["results"]["p/bad"]["p1s"]), 1)
+        self.assertIsNone(row["judge"]); self.assertEqual(row["judgeCost"], 0.01)  # the review's cost only: P1s decided, no judge call
 
     def test_audit_runs_at_its_rate_and_records_agreement(self):
         self.configure(audit="p/audit", auditRate=1)
@@ -187,7 +208,7 @@ class DualRunTest(unittest.TestCase):
         self.assertIs(self.pr.pick_winner([b, a], "A"), a); self.assertEqual(self.pr.decided_by(a, b, "A"), "judge")
 
     def test_report_reads_rows_from_before_the_judge_upgrade(self):
-        state = self.tmp / "state"; state.mkdir()
+        state = self.tmp / "state"; state.mkdir(exist_ok=True)
         (state / "dual-runs.jsonl").write_text(json.dumps({"id": "old", "judge": "p/judge", "judged": True, "winner": "p/a", "results": {
             "p/a": {"pass": True, "p1s": [], "cost": 0.1, "minutes": 1.0}, "p/b": {"pass": True, "p1s": [], "cost": 0.2, "minutes": 1.0}}}) + "\n")
         self.assertEqual(self.run_cli("report"), 0); self.assertIn("0 discordant, 0/1", self.stdout)
@@ -218,7 +239,7 @@ class DualRunTest(unittest.TestCase):
         self.assertIsNone(self.pr.parse_verdict('{"preferred": "A"}'))
 
     def test_outcomes_join(self):
-        state = self.tmp / "state"; art = self.tmp / "art"; state.mkdir(); art.mkdir()
+        state = self.tmp / "state"; art = self.tmp / "art"; state.mkdir(exist_ok=True); art.mkdir(exist_ok=True)
         (state / "routing.json").write_text(json.dumps({"routes": {"hard": ["p/big:high"]}}))
         rows = [{"ts": "2026-11-13T10:00:00.000Z", "session": "s", "call": "c1", "index": 0, "agent": "worker", "tier": "standard",
                  "minutes": 10, "tokens": 1000, "unsure": False, "model": "p/mid", "task_hash": "h", "outcome": "routed"},
@@ -236,6 +257,95 @@ class DualRunTest(unittest.TestCase):
         summary = self.pr.summarize(joined)
         self.assertIn("hard-tier model 1/2 (50%)", summary)
         self.assertIn("actual/estimate median: minutes 2.0, tokens 2.0", summary)
+
+class AdaptiveTest(Fixture):
+    """Calibrate more, evaluate less: per-cell sampling decay, the weekly eval budget, the audit floor, judge short-circuit."""
+    MODELS = ["p/free", "p/mid"]
+    arm = {"exit": 0, "p1s": [], "cost": 0.0, "minutes": 1.0}
+
+    def pair(self, held=True, **k):
+        """A finished standard/code dual run, p/free routed and p/mid its partner; held=False: the routed pick failed its
+        check while the partner passed."""
+        row = {"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "arm": "sample", "tier": "standard", "type": "code", "unsure": False,
+               "cell": "standard/code", "cellModels": self.MODELS, "models": self.MODELS, "overhead": 0.0,
+               "results": {"p/free": {**self.arm, "pass": held}, "p/mid": {**self.arm, "pass": True}},
+               "winner": "p/free" if held else "p/mid", "decidedBy": "cost" if held else "check", "judged": True}
+        return dict(row, **k)
+
+    def write(self, rows):
+        (self.tmp / "state/dual-runs.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+
+    def rate(self, base=1.0, tier="standard"):
+        self.run_cli("rate", "--tier", tier, "--type", "code", "--base", str(base))
+        return float(self.stdout)
+
+    def test_a_cell_drops_to_the_floor_after_30_held_up_runs_and_a_miss_resets_it(self):
+        self.write([self.pair() for _ in range(29)]); self.assertEqual(self.rate(), 1.0)
+        self.write([self.pair() for _ in range(30)]); self.assertEqual(self.rate(), 0.02)
+        self.assertEqual(self.rate(0.1), 0.02)
+        self.assertEqual(self.rate(0.01), 0.01)  # never raised above its own base
+        self.write([self.pair(held=False)] + [self.pair() for _ in range(30)]); self.assertEqual(self.rate(), 0.02)
+        self.write([self.pair() for _ in range(30)] + [self.pair(held=False)]); self.assertEqual(self.rate(), 1.0)
+        # confident_wrong: the routed pick failed its check, unsure was no, even though the partner failed too
+        miss = self.pair(held=False, results={"p/free": {**self.arm, "pass": False}, "p/mid": {**self.arm, "pass": False}}, winner="p/mid", decidedBy="cost")
+        self.write([self.pair() for _ in range(30)] + [miss]); self.assertEqual(self.rate(), 1.0)
+        self.write([self.pair() for _ in range(30)] + [self.pair(winner="p/mid", decidedBy="p1s")]); self.assertEqual(self.rate(), 1.0)
+        # another cell's runs and runs where a worker did not finish say nothing
+        self.write([self.pair(cell="hard/code") for _ in range(30)]); self.assertEqual(self.rate(), 1.0)
+        cut = self.pair(results={"p/free": {**self.arm, "pass": True}, "p/mid": {**self.arm, "exit": "timeout", "pass": False}})
+        self.write([self.pair() for _ in range(30)] + [cut]); self.assertEqual(self.rate(), 0.02)  # the partner did not finish
+        mute = self.pair(judged=False)  # the judge never answered and cost decided: no quality signal
+        self.write([self.pair() for _ in range(30)] + [mute]); self.assertEqual(self.rate(), 0.02)
+        self.write([self.pair() for _ in range(15)] + [mute] + [self.pair() for _ in range(14)]); self.assertEqual(self.rate(), 1.0)
+        timeout = self.pair(results={"p/free": {**self.arm, "exit": "timeout", "pass": False}, "p/mid": {**self.arm, "pass": True}}, winner="p/mid", decidedBy="finished")
+        self.write([self.pair() for _ in range(30)] + [timeout]); self.assertEqual(self.rate(), 1.0)  # the routed pick failed where its partner finished
+        self.write([self.pair() for _ in range(30)] + [dict(timeout, judged=False)]); self.assertEqual(self.rate(), 1.0)  # as logged: a failed worker leaves judged false
+
+    def test_a_changed_model_list_in_the_routing_table_resets_the_cell(self):
+        self.write([self.pair() for _ in range(30)]); self.assertEqual(self.rate(), 0.02)
+        self.routing["routes"]["standard"] = ["p/new"] + self.MODELS; self.configure()
+        self.assertEqual(self.rate(), 1.0)  # a new model came in: calibrate it from the base rate again
+
+    def test_overhead_over_ten_percent_of_savings_halves_every_rate(self):
+        saved = self.seed_savings(1_000_000)  # $20
+        self.write([self.pair(overhead=2.0)]); self.assertEqual(self.rate(), 1.0)
+        self.write([self.pair(overhead=5.0)]); self.assertEqual(self.rate(), 0.25)  # $5 -> $2.50 -> $1.25: halved twice to get under $2
+        self.write([self.pair(overhead=5.0), self.pair(at="2000-01-01T00:00:00Z", overhead=900.0)]); self.assertEqual(self.rate(), 0.25)
+        self.run_cli("report")
+        line = self.stdout.splitlines()[0]
+        self.assertEqual(saved, 20.0)
+        self.assertIn("savings $20.00 (1 routed launches), overhead $5.00 (1 dual runs), net $15.00, overhead 25% of savings (limit 10%); every rate halved 2x", line)
+
+    def test_rows_from_before_overhead_was_logged_count_the_partner_and_judge_cost(self):
+        self.seed_savings(1_000_000)  # $20
+        old = {"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "models": self.MODELS, "judgeCost": 1.0, "results": {"p/mid": {"cost": 4.0}}}
+        self.write([old]); self.assertEqual(self.rate(), 0.25)  # $5 of overhead against $20 of savings
+
+    def test_no_savings_halves_every_rate_and_report_says_insufficient_data(self):
+        self.seed_savings(0); self.assertEqual(self.rate(), 1 / 64)  # a routed launch that saved nothing
+        self.routing.pop("prices"); self.configure(); self.seed_savings(10**9)  # savings that cannot be priced count as none
+        self.assertEqual(self.rate(), 1 / 64)
+        self.run_cli("report")
+        self.assertIn("savings $0.00 (0 routed launches)", self.stdout); self.assertIn("overhead n/a", self.stdout); self.assertIn("insufficient data", self.stdout)
+
+    def test_audit_rate_drops_to_2_percent_once_40_audits_agree_at_90_percent(self):
+        dual = {"auditRate": 0.1}
+        def rate(agreed, total):
+            row = lambda ok: {"at": "2000-01-01T00:00:00Z", "judge": {"model": "p/judge"}, "audit": {"model": "p/audit", "agree": ok}}
+            self.write([row(i < agreed) for i in range(total)] + [row(None)])
+            return self.pr.audit_rate(dual, "p/audit", "p/judge")
+        self.assertEqual(rate(39, 39), 0.1)  # 39 audited pairs is not enough
+        self.assertEqual(rate(36, 40), 0.02)
+        self.assertEqual(rate(35, 40), 0.1)
+        self.assertEqual(rate(20, 60), 0.1)  # only the last 40 count, and 20 of them agree
+
+    def test_the_judge_runs_only_when_nothing_before_it_decides(self):
+        os.environ["FAKE_FIRST"] = "1"
+        _, row = self.dual(["p/good", "p/bad"], "true")  # both pass, no review, no tests: a tie until cost
+        self.assertEqual((row["decidedBy"], row["judge"]["verdict"], row["judged"]), ("cost", "discordant", True))
+        self.assertEqual(row["overhead"], 0.12)  # the partner p/bad's 0.1 plus two judge calls
+        _, row = self.dual(["p/good", "p/bad"], "grep -q 42 answer.txt")  # the check decides
+        self.assertEqual((row["decidedBy"], row["judge"], row["judged"], row["judgeCost"]), ("check", None, True, 0.0))
 
 
 if __name__ == "__main__":

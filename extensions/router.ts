@@ -5,8 +5,8 @@
 // A launch without a tier is blocked with that example. The first model in the matching routing.json list that pi
 // can use is written into the launch. Each decision goes to decisions.jsonl, and the run id from the tool result to
 // runs.jsonl, so `router.py outcomes` can join them with how the run went. Some code launches are also picked for
-// a dual run (two models, two worktrees, a check and a judge; see router.py): `unsure: yes` always, others at
-// `dual.rate`. Without routing.json the extension does nothing. Any internal error lets the launch through.
+// a dual run (two models, two worktrees, a check and a judge; see router.py): `unsure: yes` and others at `dual.rate`,
+// both lowered by `router.py rate` as a cell's picks keep holding up and as eval cost nears its savings. Without routing.json the extension does nothing. Any internal error lets the launch through.
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { execFile } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
@@ -115,15 +115,27 @@ const modelId = (spec: string) => spec.replace(/:\w+$/, "").split("/").pop()!.to
 export const needsHard = (config: any, model: string, answers: Route) =>
   answers.tier !== "hard" && [config?.routes?.hard].flat().some(m => typeof m === "string" && modelId(m) === modelId(model));
 
+// The sampling rate a launch starts from: 1 for `unsure: yes`, else dual.rate.
+export const baseRate = (config: any, answers: Route) => answers.unsure === true ? 1 : Number(config?.dual?.rate) || 0;
+
 // Should this routed code launch also run on the tier's partner model? Returns { arm, models } or null.
-// Arm "unsure": `unsure: yes`, always. Arm "sample": any other code launch, at dual.rate.
-export function pairPlan(config: any, answers: Route, model: string, task: string, rand = Math.random) {
+// Arm "unsure": `unsure: yes`. Arm "sample": any other code launch. Both are drawn at `rate`, which is the base rate
+// unless `router.py rate` lowered it: unsure launches always pair at the base rate of 1.
+export function pairPlan(config: any, answers: Route, model: string, task: string, rand = Math.random, rate = baseRate(config, answers)) {
   const partner = config?.dual?.partner?.[answers.tier];
   if (answers.type !== "code" || typeof partner !== "string" || !partner || modelId(partner) === modelId(model) || NO_PAIR.test(task)) return null;
-  const rate = Number(config.dual.rate) || 0;
-  const arm = answers.unsure === true ? "unsure" : rand() < rate ? "sample" : null;
+  const arm = rand() < rate ? (answers.unsure === true ? "unsure" : "sample") : null;
   return arm ? { arm, models: [model, partner] } : null;
 }
+
+// The rate for a launch from `router.py rate`: decayed for a cell whose picks keep holding up, halved while eval
+// overhead is over budget. Any failure answers 0, so a broken lookup never spends.
+export const effectiveRate = (dir: string, answers: Route, base: number) => new Promise<number>(resolve =>
+  execFile("python3", [CLI, "rate", "--tier", answers.tier, "--type", answers.type || "", "--base", String(base)],
+    { timeout: 10000, env: { ...process.env, SELF_IMPROVING_ROUTER_DIR: dir } }, (err, out) => {
+      const rate = parseFloat(String(out));
+      resolve(!err && Number.isFinite(rate) ? rate : 0);
+    }));
 
 export const taskHash = (task: string) => createHash("sha256").update(task).digest("hex").slice(0, 16);
 
@@ -172,7 +184,7 @@ export function pairText(arm: string, models: string[], cwd: string, taskFile: s
 
 export default function (pi: ExtensionAPI) { registerRouter(pi, process.env); }
 
-export function registerRouter(pi: any, env: Record<string, string | undefined>, now = Date.now, rand = Math.random) {
+export function registerRouter(pi: any, env: Record<string, string | undefined>, now = Date.now, rand = Math.random, rateFor = effectiveRate) {
   const dir = stateDir(env);
   const append = (file: string, rows: object[]) => {
     mkdirSync(dir, { recursive: true });
@@ -220,7 +232,9 @@ export function registerRouter(pi: any, env: Record<string, string | undefined>,
         const cwd = path.resolve(ctx?.cwd || process.cwd(), typeof event.input.cwd === "string" ? event.input.cwd.replace(/^~(?=\/|$)/, homedir()) : "");
         const key = taskHash(`${cwd}\0${only.task}`);
         for (const [k, t] of paired) if (now() - t > REISSUE_MS) paired.delete(k);
-        const plan = paired.delete(key) ? null : pairPlan(config, only.answers!, only.row.model, only.task, rand);
+        const reissued = paired.delete(key), base = baseRate(config, only.answers!);
+        const rate = reissued || only.answers!.type !== "code" || base <= 0 ? base : await rateFor(dir, only.answers!, base);
+        const plan = reissued ? null : pairPlan(config, only.answers!, only.row.model, only.task, rand, rate);
         const max = Number(config.dual?.maxPairs) || 3;
         if (plan && runsInFlight(dir, now()) < max && await insideGitRepo(cwd)) {
           const id = `${ts.replace(/\D/g, "").slice(0, 14)}-${randomBytes(3).toString("hex")}`;
