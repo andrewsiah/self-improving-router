@@ -1,0 +1,13 @@
+{
+  "name": "self-improving-router",
+  "version": "0.1.0",
+  "description": "Routes pi subagent launches to models by what the task needs, and learns from real tasks.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": ["pi-package"],
+  "repository": "github:andrewsiah/self-improving-router",
+  "files": ["extensions", "router.py", "routing.example.json"],
+  "pi": { "extensions": ["./extensions/router.ts"] },
+  "peerDependencies": { "@earendil-works/pi-coding-agent": "*" },
+  "scripts": { "test": "node --test test/router.test.ts && python3 -m unittest discover -s test" }
+}

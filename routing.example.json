@@ -1,0 +1,20 @@
+{
+  "_comment": "Example only: replace the model ids with ones your pi setup can run (pi --list-models). Copy to ~/.pi/agent/self-improving-router/routing.json.",
+  "agents": ["worker", "scout"],
+  "routes": {
+    "light": ["anthropic/claude-haiku-5-5", "anthropic/claude-sonnet-5-5"],
+    "standard": ["anthropic/claude-sonnet-5-5", "anthropic/claude-haiku-5-5"],
+    "hard": ["anthropic/claude-opus-5-5:high", "anthropic/claude-sonnet-5-5:high"],
+    "*/research": ["anthropic/claude-sonnet-5-5"]
+  },
+  "dual": {
+    "rate": 0.1,
+    "maxPairs": 3,
+    "partner": {
+      "light": "anthropic/claude-sonnet-5-5",
+      "standard": "anthropic/claude-opus-5-5:high",
+      "hard": "anthropic/claude-sonnet-5-5:high"
+    },
+    "judge": "anthropic/claude-opus-5-5:high"
+  }
+}
