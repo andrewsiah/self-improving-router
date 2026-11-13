@@ -206,7 +206,8 @@ def judge(model, arms, prompt, check, base, rundir, name="judge"):
 def cross_test(arm, rival, check, base, rundir, sub):
     """Runs the check in arm's worktree with the test files the rival added or changed copied in, then restores the
     worktree. Returns {"files": n, "ran": bool, "pass": bool or None}. A file that cannot be copied safely (a symlink,
-    a directory, a path leading outside the worktree) skips the step, recorded as "skip", so it cannot decide the pair."""
+    a directory, a path leading outside the worktree, a file where a directory is needed) skips the step, recorded as
+    "skip", so it cannot decide the pair."""
     names = sh(["git", "-C", rival["worktree"], "diff", "--name-only", "--diff-filter=AM", base, "--", ".", ":(exclude)node_modules"]).stdout
     files = [f for f in names.splitlines() if TEST_PATH.search(f)]
     rec = {"files": len(files), "ran": False, "pass": None}
@@ -217,6 +218,10 @@ def cross_test(arm, rival, check, base, rundir, sub):
             src, dst = Path(rival["worktree"]) / rel, wt / rel
             if src.is_symlink() or dst.is_symlink() or (dst.exists() and not dst.is_file()) or not dst.parent.resolve().is_relative_to(wt.resolve()):
                 raise OSError(f"unsafe path {rel}")
+            p = dst.parent
+            while p != wt and p != p.parent:  # a file where mkdir needs a directory would abort the copy mid-way
+                if p.exists() and not p.is_dir(): raise OSError(f"unsafe path {rel}")
+                p = p.parent
         for rel in files:
             src, dst = Path(rival["worktree"]) / rel, wt / rel
             if dst.exists(): saved[rel] = (dst.read_bytes(), dst.stat().st_mode)
@@ -229,9 +234,13 @@ def cross_test(arm, rival, check, base, rundir, sub):
     except OSError as e:
         rec["skip"] = str(e)[:200]
     finally:
-        for dst in added: dst.unlink(missing_ok=True)
+        for dst in added:  # keep restoring the rest even if one unlink or write fails
+            try: dst.unlink(missing_ok=True)
+            except OSError: pass
         for rel, (data, mode) in saved.items():
-            (wt / rel).write_bytes(data); (wt / rel).chmod(mode)
+            try:
+                (wt / rel).write_bytes(data); (wt / rel).chmod(mode)
+            except OSError: pass
     return rec
 
 

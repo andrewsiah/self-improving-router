@@ -147,6 +147,24 @@ class DualRunTest(unittest.TestCase):
         self.assertEqual((rec["ran"], rec["pass"]), (True, True))
         self.assertEqual(((mine / "tests/run.sh").read_text(), (mine / "tests/run.sh").stat().st_mode & 0o777), ("echo mine\n", 0o755))
 
+    def test_a_cross_test_with_a_file_where_a_dir_is_needed_skips(self):
+        # The rival adds tests/escape/z.sh but the arm has a regular file tests/escape: copying would fail mid-way,
+        # so the step skips and every file the arm had is restored or left untouched.
+        mine = self.tmp / "wt"; (mine / "tests").mkdir(parents=True)
+        (mine / "tests/a.sh").write_text("echo mine\n"); (mine / "tests/escape").write_text("a file\n")
+        rival_wt = self.tmp / "rival"; (rival_wt / "tests").mkdir(parents=True)
+        git = lambda wt, *a: subprocess.run(["git", "-C", str(wt), *a], check=True, capture_output=True, text=True)
+        git(rival_wt, "init", "-q")
+        (rival_wt / "README").write_text("x\n"); git(rival_wt, "add", ".")
+        git(rival_wt, "-c", "user.name=t", "-c", "user.email=t@e.c", "commit", "-qm", "x")
+        base = git(rival_wt, "rev-parse", "HEAD").stdout.strip()
+        (rival_wt / "tests/a.sh").write_text("echo rival\n"); (rival_wt / "tests/escape").mkdir()
+        (rival_wt / "tests/escape/z.sh").write_text("echo rival\n"); git(rival_wt, "add", "-N", ".")
+        rec = self.pr.cross_test({"worktree": str(mine), "label": "A"}, {"worktree": str(rival_wt), "label": "B"}, "true", base, self.tmp, "")
+        self.assertIn("skip", rec); self.assertFalse(rec["ran"])
+        self.assertEqual((mine / "tests/a.sh").read_text(), "echo mine\n")
+        self.assertEqual((mine / "tests/escape").read_text(), "a file\n")
+
     def test_a_skipped_cross_test_counts_for_neither_side(self):
         arm = lambda label, cross: {"label": label, "exit": 0, "pass": True, "cross": cross, "p1s": [], "cost": 0.1, "minutes": 1}
         a, b = arm("A", {"ran": True, "pass": False, "void": True}), arm("B", {"ran": False, "pass": None, "skip": "x", "void": True})
